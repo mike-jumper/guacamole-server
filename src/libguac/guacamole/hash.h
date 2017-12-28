@@ -30,6 +30,20 @@
 
 #include <cairo/cairo.h>
 
+#include <stdint.h>
+
+typedef struct guac_hash_search_state {
+
+    int x;
+
+    int y;
+
+    uint64_t value;
+
+} guac_hash_search_state;
+
+typedef int guac_hash_callback(int x, int y, uint64_t hash, void* closure);
+
 /**
  * Produces a 24-bit hash value from all pixels of the given surface. The
  * surface provided must be RGB or ARGB with each pixel stored in 32 bits.
@@ -41,6 +55,25 @@
  *         distributed across different images.
  */
 unsigned int guac_hash_surface(cairo_surface_t* surface);
+
+int guac_hash_foreach_surface_rect(cairo_surface_t* surface, int rect_width,
+        int rect_height, guac_hash_callback* callback, void* closure);
+
+int guac_hash_foreach_image_rect(unsigned char* data, int width, int height,
+        int stride, int rect_width, int rect_height,
+        guac_hash_callback* callback, void* closure);
+
+int guac_hash_search_image(unsigned char* haystack_data, int haystack_width,
+        int haystack_height, int haystack_stride, unsigned char* needle_data,
+        int needle_width, int needle_height, int needle_stride,
+        int* found_x, int* found_y);
+
+int guac_hash_search_surface(cairo_surface_t* haystack, cairo_surface_t* needle,
+        int* found_x, int* found_y);
+
+int guac_image_cmp(unsigned char* data_a, int width_a, int height_a,
+        int stride_a, unsigned char* data_b, int width_b, int height_b,
+        int stride_b);
 
 /**
  * Given two Cairo surfaces, returns zero if the data contained within each

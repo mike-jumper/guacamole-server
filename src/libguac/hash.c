@@ -18,6 +18,7 @@
  */
 
 #include "config.h"
+#include "guacamole/hash.h"
 
 #include <cairo/cairo.h>
 
@@ -96,19 +97,144 @@ unsigned int guac_hash_surface(cairo_surface_t* surface) {
 
 }
 
-int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
+static int guac_hash_assign_value(int x, int y, uint64_t hash, void* closure) {
+    *((uint64_t*) closure) = hash;
+    return 1;
+}
 
-    /* Surface A metrics */
-    unsigned char* data_a = cairo_image_surface_get_data(a);
-    int width_a = cairo_image_surface_get_width(a);
-    int height_a = cairo_image_surface_get_height(a);
-    int stride_a = cairo_image_surface_get_stride(a);
+static int guac_hash_find_value(int x, int y, uint64_t hash, void* closure) {
 
-    /* Surface B metrics */
-    unsigned char* data_b = cairo_image_surface_get_data(b);
-    int width_b = cairo_image_surface_get_width(b);
-    int height_b = cairo_image_surface_get_height(b);
-    int stride_b = cairo_image_surface_get_stride(b);
+    guac_hash_search_state* state = (guac_hash_search_state*) closure;
+
+    /* Store coordinates of matchin rectangle if hash matches */
+    if (state->value == hash) {
+        state->x = x;
+        state->y = y;
+        return 1;
+    }
+
+    /* Hash does not currently match */
+    return 0;
+
+}
+
+int guac_hash_foreach_image_rect(unsigned char* data, int width, int height,
+        int stride, int rect_width, int rect_height,
+        guac_hash_callback* callback, void* closure) {
+
+    /* Only 64x64 is currently supported */
+    if (rect_width != 64 || rect_height != 64)
+        return 0;
+
+    int x, y;
+    uint64_t cell_hash[4096] = { 0 };
+
+    for (y = 0; y < height; y++) {
+
+        uint64_t* current_cell_hash = cell_hash;
+
+        /* Get current row */
+        uint32_t* row = (uint32_t*) data;
+        data += stride;
+
+        /* Calculate row segment hashes for entire row */
+        uint64_t row_hash = 0;
+        for (x = 0; x < width; x++) {
+
+            /* Get current pixel */
+            uint32_t pixel = *(row++);
+
+            /* Update hash value for current row segment */
+            row_hash = ((row_hash * 31) << 1) + pixel;
+
+            /* Incorporate row hash value into overall cell hash */
+            uint64_t cell_hash = ((*current_cell_hash * 31) << 1) + row_hash;
+            *(current_cell_hash++) = cell_hash;
+
+            /* Invoke callback for every hash generated, breaking out early if
+             * requested */
+            if (y >= rect_height - 1 && x >= rect_width - 1) {
+                int result = callback(x - rect_width + 1, y - rect_height + 1,
+                        cell_hash, closure);
+                if (result)
+                    return result;
+            }
+
+        }
+
+    } /* end for each row */
+
+    return 0;
+
+}
+
+int guac_hash_foreach_surface_rect(cairo_surface_t* surface, int rect_width,
+        int rect_height, guac_hash_callback* callback, void* closure) {
+
+    /* Surface metrics */
+    unsigned char* data = cairo_image_surface_get_data(surface);
+    int width = cairo_image_surface_get_width(surface);
+    int height = cairo_image_surface_get_height(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+
+    return guac_hash_foreach_image_rect(data, width, height, stride,
+            rect_width, rect_height, callback, closure);
+
+}
+
+int guac_hash_search_image(unsigned char* haystack_data, int haystack_width,
+        int haystack_height, int haystack_stride, unsigned char* needle_data,
+        int needle_width, int needle_height, int needle_stride,
+        int* found_x, int* found_y) {
+
+    /* If there isn't room for the needle, it can't possibly be present */
+    if (haystack_width < needle_width || haystack_height < needle_height)
+        return 0;
+
+    /* Calculate hash value of needle */
+    guac_hash_search_state state = { 0 };
+    guac_hash_foreach_image_rect(needle_data, needle_width, needle_height,
+            needle_stride, needle_width, needle_height,
+            guac_hash_assign_value, &state.value);
+
+    /* Search for needle in haystack */
+    if (guac_hash_foreach_image_rect(haystack_data, haystack_width,
+                haystack_height, haystack_stride, needle_width, needle_height,
+                guac_hash_find_value, &state)) {
+        *found_x = state.x;
+        *found_y = state.y;
+        return 1;
+    }
+
+    /* Failed to find needle */
+    return 0;
+
+}
+
+int guac_hash_search_surface(cairo_surface_t* haystack, cairo_surface_t* needle,
+        int* found_x, int* found_y) {
+
+    /* Haystack metrics */
+    unsigned char* haystack_data = cairo_image_surface_get_data(haystack);
+    int haystack_width = cairo_image_surface_get_width(haystack);
+    int haystack_height = cairo_image_surface_get_height(haystack);
+    int haystack_stride = cairo_image_surface_get_stride(haystack);
+
+    /* Needle metrics */
+    unsigned char* needle_data = cairo_image_surface_get_data(needle);
+    int needle_width = cairo_image_surface_get_width(needle);
+    int needle_height = cairo_image_surface_get_height(needle);
+    int needle_stride = cairo_image_surface_get_stride(needle);
+
+    return guac_hash_search_image(haystack_data, haystack_width,
+            haystack_height, haystack_stride, needle_data, needle_width,
+            needle_height, needle_stride, found_x, found_y);
+
+}
+
+int guac_image_cmp(unsigned char* data_a, int width_a, int height_a,
+        int stride_a, unsigned char* data_b, int width_b, int height_b,
+        int stride_b) {
 
     int y;
 
@@ -116,7 +242,7 @@ int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
     if (width_a != width_b) return width_a - width_b;
     if (height_a != height_b) return height_a - height_b;
 
-    for (y=0; y<height_a; y++) {
+    for (y = 0; y < height_a; y++) {
 
         /* Compare row. If different, use that result. */
         int cmp_result = memcmp(data_a, data_b, width_a * 4);
@@ -131,5 +257,24 @@ int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
 
     /* Otherwise, same. */
     return 0;
+
+}
+
+int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
+
+    /* Surface A metrics */
+    unsigned char* data_a = cairo_image_surface_get_data(a);
+    int width_a = cairo_image_surface_get_width(a);
+    int height_a = cairo_image_surface_get_height(a);
+    int stride_a = cairo_image_surface_get_stride(a);
+
+    /* Surface B metrics */
+    unsigned char* data_b = cairo_image_surface_get_data(b);
+    int width_b = cairo_image_surface_get_width(b);
+    int height_b = cairo_image_surface_get_height(b);
+    int stride_b = cairo_image_surface_get_stride(b);
+
+    return guac_image_cmp(data_a, width_a, height_a, stride_a,
+            data_b, width_b, height_b, stride_b);
 
 }
