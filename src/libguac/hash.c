@@ -25,6 +25,28 @@
 #include <stdint.h>
 #include <string.h>
 
+typedef struct guac_hash_search_state {
+
+    unsigned char* haystack_data;
+
+    int haystack_stride;
+
+    unsigned char* needle_data;
+
+    int needle_stride;
+
+    int needle_width;
+
+    int needle_height;
+
+    int x;
+
+    int y;
+
+    uint64_t value;
+
+} guac_hash_search_state;
+
 /*
  * Arbitrary hash function whhich maps ALL 32-bit numbers onto 24-bit numbers
  * evenly, while guaranteeing that all 24-bit numbers are mapped onto
@@ -106,11 +128,23 @@ static int guac_hash_find_value(int x, int y, uint64_t hash, void* closure) {
 
     guac_hash_search_state* state = (guac_hash_search_state*) closure;
 
-    /* Store coordinates of matchin rectangle if hash matches */
+    /* Verify possibly-matching rectangle if hash matches */
     if (state->value == hash) {
-        state->x = x;
-        state->y = y;
-        return 1;
+
+        unsigned char* current = state->haystack_data + (x * 4)
+            + (y * state->haystack_stride);
+
+        int width = state->needle_width;
+        int height = state->needle_height;
+
+        /* Store coordinates and stop if rectangle contents are correct */
+        if (!guac_image_cmp(current, width, height, state->haystack_stride,
+                    state->needle_data, width, height, state->needle_stride)) {
+            state->x = x;
+            state->y = y;
+            return 1;
+        }
+
     }
 
     /* Hash does not currently match */
@@ -191,8 +225,19 @@ int guac_hash_search_image(unsigned char* haystack_data, int haystack_width,
     if (haystack_width < needle_width || haystack_height < needle_height)
         return 0;
 
+    guac_hash_search_state state = {
+
+        .haystack_data   = haystack_data,
+        .haystack_stride = haystack_stride,
+
+        .needle_data   = needle_data,
+        .needle_stride = needle_stride,
+        .needle_width  = needle_width,
+        .needle_height = needle_height
+
+    };
+
     /* Calculate hash value of needle */
-    guac_hash_search_state state = { 0 };
     guac_hash_foreach_image_rect(needle_data, needle_width, needle_height,
             needle_stride, needle_width, needle_height,
             guac_hash_assign_value, &state.value);

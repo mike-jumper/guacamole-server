@@ -32,16 +32,6 @@
 
 #include <stdint.h>
 
-typedef struct guac_hash_search_state {
-
-    int x;
-
-    int y;
-
-    uint64_t value;
-
-} guac_hash_search_state;
-
 typedef int guac_hash_callback(int x, int y, uint64_t hash, void* closure);
 
 /**
