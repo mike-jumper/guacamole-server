@@ -325,6 +325,12 @@ int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
 
 }
 
+/**
+ * The number of pixels compared in each step while determining the largest
+ * common rectangle.
+ */
+#define STEP_SIZE 16
+
 typedef struct rect_edge {
 
     int x;
@@ -371,14 +377,19 @@ int guac_image_find_largest_common_rect(int* rect_x, int* rect_y,
         /* For each column */
         const uint32_t* value_a = (const uint32_t*) data_a;
         const uint32_t* value_b = (const uint32_t*) data_b;
-        for (int x = 0; x <= min_width; x++) {
+        for (int x = 0; x <= min_width; x += STEP_SIZE) {
 
             int height;
 
+            /* Restrict number of bytes compared to bytes remaining */
+            int cmp_size = STEP_SIZE;
+            if (cmp_size > min_width - x)
+                cmp_size = min_width - x;
+
             /* Continously track vertical runs as the rectangle height */
-            if (x == min_width)
+            if (x + STEP_SIZE > min_width)
                 height = 0;
-            else if (*value_a == *value_b)
+            else if (!memcmp(value_a, value_b, sizeof(uint32_t) * cmp_size))
                 height = ++run_length[x];
             else
                 height = run_length[x] = 0;
@@ -417,8 +428,8 @@ int guac_image_find_largest_common_rect(int* rect_x, int* rect_y,
             }
 
             /* Advance to next column */
-            value_a++;
-            value_b++;
+            value_a += STEP_SIZE;
+            value_b += STEP_SIZE;
 
         }
 
