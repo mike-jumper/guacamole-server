@@ -439,6 +439,10 @@ int guac_image_find_largest_common_rect(int* rect_x, int* rect_y,
 
     }
 
+    /* Free scratch area */
+    free(edge_stack);
+    free(run_length);
+
     return best_area;
 
 }
