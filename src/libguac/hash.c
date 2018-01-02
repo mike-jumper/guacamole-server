@@ -23,6 +23,7 @@
 #include <cairo/cairo.h>
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct guac_hash_search_state {
@@ -323,3 +324,111 @@ int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b) {
             data_b, width_b, height_b, stride_b);
 
 }
+
+typedef struct rect_edge {
+
+    int x;
+
+    int height;
+
+} rect_edge;
+
+int guac_image_find_largest_common_rect(int* rect_x, int* rect_y,
+        int* rect_width, int* rect_height,
+        unsigned char* data_a, int width_a, int height_a, int stride_a,
+        unsigned char* data_b, int width_b, int height_b, int stride_b) {
+
+    int best_area = 0;
+
+    /* Determine smallest common width */
+    int min_width = width_a;
+    if (width_b < min_width)
+        min_width = width_b;
+
+    /* Determine smallest common height */
+    int min_height = height_a;
+    if (height_b < min_height)
+        min_height = height_b;
+
+    /* Allocate scratch space for tracking vertical run lengths */
+    int* run_length = calloc(min_width, sizeof(int));
+    if (run_length == NULL)
+        return 0;
+
+    /* Allocate scratch space for stack of rectangle edges */
+    rect_edge* edge_stack = malloc(sizeof(rect_edge) * min_width);
+    if (edge_stack == NULL) {
+        free(run_length);
+        return 0;
+    }
+
+    /* For each row */
+    for (int y = 0; y < min_height; y++) {
+
+        /* Start with empty stack */
+        int stack_top = 0;
+
+        /* For each column */
+        const uint32_t* value_a = (const uint32_t*) data_a;
+        const uint32_t* value_b = (const uint32_t*) data_b;
+        for (int x = 0; x <= min_width; x++) {
+
+            int height;
+
+            /* Continously track vertical runs as the rectangle height */
+            if (x == min_width)
+                height = 0;
+            else if (*value_a == *value_b)
+                height = ++run_length[x];
+            else
+                height = run_length[x] = 0;
+
+            /* Push new edge onto stack if increasing, as rectangles with such
+             * edges overlap */
+            if (stack_top == 0 || height > edge_stack[stack_top - 1].height)
+                edge_stack[stack_top++] = (rect_edge) { x, height };
+
+            /* If decreasing, remove edges of rects which no longer contribute
+             * to the overlap (earlier rect edges may still contribute),
+             * updating the best area discovered */
+            else {
+
+                rect_edge popped = { 0 };
+
+                while (stack_top != 0 && height <= edge_stack[stack_top - 1].height) {
+
+                    popped = edge_stack[--stack_top];
+
+                    int width = x - popped.x;
+                    int area = popped.height * width;
+
+                    if (area > best_area) {
+                        *rect_x = popped.x;
+                        *rect_y = y - popped.height + 1;
+                        *rect_height = popped.height;
+                        *rect_width = width;
+                        best_area = area;
+                    }
+
+                }
+
+                edge_stack[stack_top++] = (rect_edge) { popped.x, height };
+
+            }
+
+            /* Advance to next column */
+            value_a++;
+            value_b++;
+
+        }
+
+        /* Advance to next row of data */
+        data_a += stride_a;
+        data_b += stride_b;
+
+    }
+
+    return best_area;
+
+}
+

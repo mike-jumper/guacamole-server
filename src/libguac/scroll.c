@@ -97,6 +97,9 @@ int guac_scroll_find_common_rect(cairo_surface_t* a, int* ax, int* ay,
     if (guac_scroll_estimate_delta(data_a, width_a, height_a, stride_a,
                 data_b, width_b, height_b, stride_b, &delta_x, &delta_y)) {
 
+        int offset_x;
+        int offset_y;
+
         /* Translate relative X to absolute X coordinates and width */
         if (delta_x < 0) {
             *width = width_b + delta_x;
@@ -124,9 +127,18 @@ int guac_scroll_find_common_rect(cairo_surface_t* a, int* ax, int* ay,
         data_a += (*ax * 4) + (*ay * stride_a);
         data_b += (*bx * 4) + (*by * stride_b);
 
-        /* Scrolled if rectangle does indeed match */
-        return !guac_image_cmp(data_a, *width, *height, stride_a,
-                data_b, *width, *height, stride_b);
+        /* Scrolled if some reasonable portion of rectangle matches */
+        if (guac_image_find_largest_common_rect(&offset_x, &offset_y, width,
+                    height, data_a, *width, *height, stride_a,
+                    data_b, *width, *height, stride_b)) {
+
+            *ax += offset_x;
+            *bx += offset_x;
+            *ay += offset_y;
+            *by += offset_y;
+            return 1;
+
+        }
 
     }
 

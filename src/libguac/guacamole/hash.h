@@ -78,5 +78,10 @@ int guac_image_cmp(unsigned char* data_a, int width_a, int height_a,
  */
 int guac_surface_cmp(cairo_surface_t* a, cairo_surface_t* b);
 
+int guac_image_find_largest_common_rect(int* rect_x, int* rect_y,
+        int* rect_width, int* rect_height,
+        unsigned char* data_a, int width_a, int height_a, int stride_a,
+        unsigned char* data_b, int width_b, int height_b, int stride_b);
+
 #endif
 
