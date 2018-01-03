@@ -25,11 +25,13 @@
 #include <guacamole/client.h>
 #include <guacamole/layer.h>
 #include <guacamole/protocol.h>
+#include <guacamole/scroll.h>
 #include <guacamole/socket.h>
 #include <guacamole/timestamp.h>
 #include <guacamole/user.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -1678,6 +1680,33 @@ static void __guac_common_surface_flush_to_png(guac_common_surface* surface,
                     0x00, 0x00, 0x00, 0xFF);
 
         }
+
+        /* STUB */ {
+
+            /* Get Cairo surface for specified rect */
+            unsigned char* flushed_buffer = surface->flushed_buffer
+                                  + surface->dirty_rect.y * surface->stride
+                                  + surface->dirty_rect.x * 4;
+
+
+            cairo_surface_t* before = cairo_image_surface_create_for_data(
+                    flushed_buffer, CAIRO_FORMAT_RGB24,
+                    surface->dirty_rect.width, surface->dirty_rect.height,
+                    surface->stride);
+
+            int ax, ay, width, height;
+            int bx, by;
+
+            /* Test whether draw can be accomplished through a copy */
+            if (guac_scroll_find_common_rect(before, &ax, &ay, &width, &height,
+                    rect, &bx, &by))
+                fprintf(stderr, "SCROLL!!! (%i, %i) %ix%i -> (%i, %i)\n",
+                        ax, ay, width, height, bx, by);
+
+            cairo_surface_destroy(before);
+
+        }
+
 
         /* Send PNG for rect */
         guac_client_stream_png(surface->client, socket, GUAC_COMP_OVER,
