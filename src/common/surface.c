@@ -1632,6 +1632,67 @@ static void __guac_common_surface_flush_buffer(guac_common_surface* surface) {
 
 }
 
+static void __guac_common_surface_png_rect(guac_common_surface* surface,
+        int left, int top, int right, int bottom) {
+
+    guac_socket* socket = surface->socket;
+    const guac_layer* layer = surface->layer;
+
+    int width = right - left;
+    int height = bottom - top;
+
+    /* Send nothing if empty */
+    if (width <= 0 || height <= 0)
+        return;
+
+    /* Get Cairo surface for specified rect */
+    unsigned char* buffer = surface->buffer
+                          + top * surface->stride
+                          + left * 4;
+
+    cairo_surface_t* rect = cairo_image_surface_create_for_data(buffer,
+                    CAIRO_FORMAT_RGB24, width, height, surface->stride);
+
+    guac_client_stream_png(surface->client, socket, GUAC_COMP_OVER,
+            layer, left, top, rect);
+
+    cairo_surface_destroy(rect);
+
+}
+
+static void __guac_common_surface_copy_png(guac_common_surface* surface,
+        int ax, int ay, int width, int height, int bx, int by) {
+
+    guac_socket* socket = surface->socket;
+    const guac_layer* layer = surface->layer;
+
+    /* Send copy */
+    guac_protocol_send_copy(socket, layer,
+            surface->dirty_rect.x + ax,
+            surface->dirty_rect.y + ay,
+            width, height,
+            GUAC_COMP_OVER, layer,
+            surface->dirty_rect.x + bx,
+            surface->dirty_rect.y + by);
+
+
+    int left = surface->dirty_rect.x;
+    int right = surface->dirty_rect.x + surface->dirty_rect.width;
+    int top = surface->dirty_rect.y;
+    int bottom = surface->dirty_rect.y + surface->dirty_rect.height;
+
+    int copy_left = left + bx;
+    int copy_right = copy_left + width;
+    int copy_top = top + by;
+    int copy_bottom = copy_top + height;
+
+    __guac_common_surface_png_rect(surface, left, top,         right, copy_top);
+    __guac_common_surface_png_rect(surface, left, copy_bottom, right, bottom);
+    __guac_common_surface_png_rect(surface, left,       copy_top, copy_left, copy_bottom);
+    __guac_common_surface_png_rect(surface, copy_right, copy_top, right,     copy_bottom);
+
+}
+
 /**
  * Flushes the bitmap update currently described by the dirty rectangle within
  * the given surface directly via an "img" instruction as PNG data. The
@@ -1699,18 +1760,23 @@ static void __guac_common_surface_flush_to_png(guac_common_surface* surface,
 
             /* Test whether draw can be accomplished through a copy */
             if (guac_scroll_find_common_rect(before, &ax, &ay, &width, &height,
-                    rect, &bx, &by))
+                    rect, &bx, &by)) {
                 fprintf(stderr, "SCROLL!!! (%i, %i) %ix%i -> (%i, %i)\n",
                         ax, ay, width, height, bx, by);
+                __guac_common_surface_copy_png(surface, ax, ay, width, height,
+                        bx, by);
+            }
+
+            /* Send PNG for rect */
+            else
+                guac_client_stream_png(surface->client, socket, GUAC_COMP_OVER,
+                        layer, surface->dirty_rect.x, surface->dirty_rect.y, rect);
 
             cairo_surface_destroy(before);
 
         }
 
 
-        /* Send PNG for rect */
-        guac_client_stream_png(surface->client, socket, GUAC_COMP_OVER,
-                layer, surface->dirty_rect.x, surface->dirty_rect.y, rect);
 
         cairo_surface_destroy(rect);
         surface->realized = 1;
