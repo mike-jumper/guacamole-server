@@ -1217,8 +1217,10 @@ guac_common_surface* guac_common_surface_alloc(guac_client* client,
     pthread_mutex_init(&surface->_lock, NULL);
 
     /* Create corresponding Cairo surface */
-    surface->stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w);
+    int dirty_offset = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w);
+    surface->stride = dirty_offset * 2;
     surface->buffer = calloc(h, surface->stride);
+    surface->flushed_buffer = surface->buffer + dirty_offset;
 
     /* Create corresponding heat map */
     surface->heat_map = calloc(heat_width * heat_height,
@@ -1282,10 +1284,12 @@ void guac_common_surface_resize(guac_common_surface* surface, int w, int h) {
     guac_common_rect_init(&old_rect, 0, 0, surface->width, surface->height);
 
     /* Re-initialize at new size */
+    int dirty_offset = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w);
     surface->width  = w;
     surface->height = h;
-    surface->stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w);
+    surface->stride = dirty_offset * 2;
     surface->buffer = calloc(h, surface->stride);
+    surface->flushed_buffer = surface->buffer + dirty_offset;
     __guac_common_bound_rect(surface, &surface->clip_rect, NULL, NULL);
 
     /* Copy relevant old data */
@@ -1602,6 +1606,30 @@ void guac_common_surface_reset_clip(guac_common_surface* surface) {
     pthread_mutex_unlock(&surface->_lock);
 }
 
+static void __guac_common_surface_flush_buffer(guac_common_surface* surface) {
+
+    unsigned char* buffer = surface->buffer
+                          + surface->dirty_rect.y * surface->stride
+                          + surface->dirty_rect.x * 4;
+
+    unsigned char* flushed_buffer = surface->flushed_buffer
+                          + surface->dirty_rect.y * surface->stride
+                          + surface->dirty_rect.x * 4;
+
+    int width = surface->dirty_rect.width;
+    int height = surface->dirty_rect.height;
+
+    for (int y = 0; y < height; y++) {
+
+        memcpy(flushed_buffer, buffer, width*4);
+
+        buffer += surface->stride;
+        flushed_buffer += surface->stride;
+
+    }
+
+}
+
 /**
  * Flushes the bitmap update currently described by the dirty rectangle within
  * the given surface directly via an "img" instruction as PNG data. The
@@ -1659,6 +1687,7 @@ static void __guac_common_surface_flush_to_png(guac_common_surface* surface,
         surface->realized = 1;
 
         /* Surface is no longer dirty */
+        __guac_common_surface_flush_buffer(surface);
         surface->dirty = 0;
 
     }
@@ -1737,6 +1766,7 @@ static void __guac_common_surface_flush_to_jpeg(guac_common_surface* surface) {
         surface->realized = 1;
 
         /* Surface is no longer dirty */
+        __guac_common_surface_flush_buffer(surface);
         surface->dirty = 0;
 
     }
@@ -1799,6 +1829,7 @@ static void __guac_common_surface_flush_to_webp(guac_common_surface* surface,
         surface->realized = 1;
 
         /* Surface is no longer dirty */
+        __guac_common_surface_flush_buffer(surface);
         surface->dirty = 0;
 
     }

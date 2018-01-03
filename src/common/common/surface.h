@@ -174,6 +174,8 @@ typedef struct guac_common_surface {
      */
     unsigned char* buffer;
 
+    unsigned char* flushed_buffer;
+
     /**
      * Non-zero if the location or parent layer of this surface has been
      * changed and needs to be flushed, 0 otherwise.
