@@ -68,17 +68,26 @@ unsigned int _guac_hash_32to24(unsigned int value) {
 }
 
 /**
- * Rotates a given 32-bit integer by N bits.
+ * Rotates a given 32-bit integer right by N bits. Most compilers should
+ * recognize this as a right rotation and optimize things down to a single
+ * instruction.
  *
- * NOTE: We probably should check for available bitops.h macros first.
+ * @param value
+ *     The 32-bit integer to rotate.
+ *
+ * @param amount
+ *     The number of bits to rotate by.
+ *
+ * @return
+ *     The given 32-bit integer rotated by the given number of bits.
  */
-unsigned int _guac_rotate(unsigned int value, int amount) {
+static uint32_t _guac_rotate(uint32_t value, int amount) {
 
     /* amount = amount % 32 */
     amount &= 0x1F; 
 
     /* Return rotated amount */
-    return (value >> amount) | (value << (32 - amount));
+    return (value >> amount) | (value << (-amount & 0x1F));
 
 }
 
