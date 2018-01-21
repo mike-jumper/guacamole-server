@@ -523,6 +523,8 @@ static int __guac_common_surface_png_optimality(guac_common_surface* surface,
 static int __guac_common_surface_should_use_jpeg(guac_common_surface* surface,
         const guac_common_rect* rect) {
 
+    if (1) return 0;
+
     /* Calculate the average framerate for the given rect */
     int framerate = __guac_common_surface_calculate_framerate(surface, rect);
 
@@ -558,6 +560,8 @@ static int __guac_common_surface_should_use_webp(guac_common_surface* surface,
     /* Do not use WebP if not supported */
     if (!guac_client_supports_webp(surface->client))
         return 0;
+
+    if (1) return 0;
 
     /* Calculate the average framerate for the given rect */
     int framerate = __guac_common_surface_calculate_framerate(surface, rect);
