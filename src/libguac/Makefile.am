@@ -73,6 +73,7 @@ libguacinc_HEADERS =                  \
     guacamole/user-constants.h        \
     guacamole/user-fntypes.h          \
     guacamole/user-types.h            \
+    guacamole/video.h                 \
     guacamole/wol.h                   \
     guacamole/wol-constants.h
 
@@ -80,9 +81,11 @@ noinst_HEADERS =      \
     id.h              \
     encode-jpeg.h     \
     encode-png.h      \
+    ffmpeg-compat.h   \
     palette.h         \
     user-handlers.h   \
     raw_encoder.h     \
+    video-private.h   \
     wait-fd.h
 
 libguac_la_SOURCES =   \
@@ -92,6 +95,7 @@ libguac_la_SOURCES =   \
     encode-jpeg.c      \
     encode-png.c       \
     error.c            \
+    ffmpeg-compat.c    \
     hash.c             \
     id.c               \
     palette.c          \
@@ -110,6 +114,7 @@ libguac_la_SOURCES =   \
     user.c             \
     user-handlers.c    \
     user-handshake.c   \
+    video.c            \
     wait-fd.c	       \
     wol.c
 
@@ -131,18 +136,24 @@ libguac_la_SOURCES += socket-wsa.c
 libguacinc_HEADERS += guacamole/socket-wsa.h
 endif
 
-libguac_la_CFLAGS = \
+libguac_la_CFLAGS =  \
+    @AVCODEC_CFLAGS@ \
+    @AVUTIL_CFLAGS@  \
+    @SWSCALE_CFLAGS@ \
     -Werror -Wall -pedantic
 
 libguac_la_LDFLAGS =     \
     -version-info 19:0:0 \
     -no-undefined        \
+    @AVCODEC_LIBS@       \
+    @AVUTIL_LIBS@        \
     @CAIRO_LIBS@         \
     @DL_LIBS@            \
     @JPEG_LIBS@          \
     @PNG_LIBS@           \
     @PTHREAD_LIBS@       \
     @SSL_LIBS@           \
+    @SWSCALE_LIBS@       \
     @UUID_LIBS@          \
     @VORBIS_LIBS@        \
     @WEBP_LIBS@          \
