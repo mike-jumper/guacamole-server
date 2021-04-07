@@ -28,6 +28,8 @@
 #include <guacamole/layer.h>
 #include <guacamole/protocol.h>
 #include <guacamole/socket.h>
+#include <guacamole/stream.h>
+#include <guacamole/video.h>
 
 #include <pthread.h>
 
@@ -119,6 +121,20 @@ typedef struct guac_common_surface {
      * The socket to send instructions on when flushing.
      */
     guac_socket* socket;
+
+    /**
+     * The current video encoding context of this surface, if the surface
+     * contents are being streamed as video rather than traditional graphical
+     * updates. If video is not currently being encoded, this will be NULL.
+     */
+    guac_video* video;
+
+    /**
+     * The stream that should be used to send blobs of video data produced as
+     * the surface contents are encoded as a video stream. If video is not
+     * currently being encoded, this will be NULL.
+     */
+    guac_stream* video_stream;
 
     /**
      * The number of simultaneous touches that this surface can accept, where 0

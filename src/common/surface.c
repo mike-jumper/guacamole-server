@@ -307,6 +307,11 @@ static int __guac_common_should_combine(guac_common_surface* surface, const guac
     if (!surface->realized)
         return 1;
 
+    /* Always combine updates if the surface is rendering as a standard video
+     * stream (rather than traditional graphical updates) */
+    if (surface->video != NULL)
+        return 1;
+
     if (surface->dirty) {
 
         int combined_cost, dirty_cost, update_cost;
@@ -1263,6 +1268,15 @@ guac_common_surface* guac_common_surface_alloc(guac_client* client,
     else
         surface->realized = 0;
 
+    /* TODONT: Always stream surface as video (in practice, this should only be
+     * done when the surface is detected as potentially benefiting from video
+     * streaming, and even then only for the codecs declared as supported by
+     * the client during the handshake) */
+    surface->video_stream = guac_client_alloc_stream(client);
+    guac_protocol_send_video(socket, surface->video_stream, layer, "video/h264");
+    surface->video = guac_video_alloc(socket, surface->video_stream,
+            "libx264", w, h, 8000000);
+
     return surface;
 }
 
@@ -1888,6 +1902,23 @@ static void __guac_common_surface_flush_properties(
 }
 
 static void __guac_common_surface_flush(guac_common_surface* surface) {
+
+    /* If video is being encoded, ignore the bitmap queue and flush directly as
+     * a new video frame */
+    if (surface->video != NULL) {
+
+        cairo_surface_t* frame_surface = cairo_image_surface_create_for_data(
+                surface->buffer, CAIRO_FORMAT_ARGB32,
+                surface->width, surface->height, surface->stride);
+
+        guac_video_advance_timeline(surface->video, guac_timestamp_current());
+        guac_video_prepare_frame(surface->video, frame_surface);
+
+        cairo_surface_destroy(frame_surface);
+        surface->bitmap_queue_length = 0;
+        return;
+
+    }
 
     /* Flush final dirty rectangle to queue. */
     __guac_common_surface_flush_to_queue(surface);
