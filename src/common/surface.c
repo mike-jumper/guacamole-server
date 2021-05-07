@@ -1272,10 +1272,12 @@ guac_common_surface* guac_common_surface_alloc(guac_client* client,
      * done when the surface is detected as potentially benefiting from video
      * streaming, and even then only for the codecs declared as supported by
      * the client during the handshake) */
-    surface->video_stream = guac_client_alloc_stream(client);
-    guac_protocol_send_video(socket, surface->video_stream, layer, "video/h264");
-    surface->video = guac_video_alloc(socket, surface->video_stream,
-            "libx264", w, h, 8000000);
+    if (layer->index == GUAC_DEFAULT_LAYER->index) {
+        surface->video_stream = guac_client_alloc_stream(client);
+        guac_protocol_send_video(socket, surface->video_stream, layer, "video/h264");
+        surface->video = guac_video_alloc(socket, surface->video_stream,
+                "libx264", w, h, 8000000);
+    }
 
     return surface;
 }
