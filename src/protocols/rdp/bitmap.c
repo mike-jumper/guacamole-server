@@ -19,13 +19,13 @@
 
 #include "bitmap.h"
 #include "common/display.h"
-#include "common/surface.h"
 #include "config.h"
 #include "rdp.h"
 
 #include <cairo/cairo.h>
 #include <freerdp/freerdp.h>
 #include <guacamole/client.h>
+#include <guacamole/surface.h>
 #include <winpr/crt.h>
 #include <winpr/wtypes.h>
 
@@ -50,7 +50,7 @@ void guac_rdp_cache_bitmap(rdpContext* context, rdpBitmap* bitmap) {
             bitmap->width, bitmap->height, 4*bitmap->width);
 
         /* Send surface to buffer */
-        guac_common_surface_draw(buffer->surface, 0, 0, image);
+        guac_surface_draw(buffer->surface, 0, 0, image);
 
         /* Free surface */
         cairo_surface_destroy(image);
@@ -90,7 +90,7 @@ BOOL guac_rdp_bitmap_paint(rdpContext* context, rdpBitmap* bitmap) {
 
     /* If cached, retrieve from cache */
     if (buffer != NULL)
-        guac_common_surface_copy(buffer->surface, 0, 0, width, height,
+        guac_surface_copy(buffer->surface, 0, 0, width, height,
                 rdp_client->display->default_surface,
                 bitmap->left, bitmap->top);
 
@@ -103,7 +103,7 @@ BOOL guac_rdp_bitmap_paint(rdpContext* context, rdpBitmap* bitmap) {
             width, height, 4*bitmap->width);
 
         /* Draw image on default surface */
-        guac_common_surface_draw(rdp_client->display->default_surface,
+        guac_surface_draw(rdp_client->display->default_surface,
                 bitmap->left, bitmap->top, image);
 
         /* Free surface */

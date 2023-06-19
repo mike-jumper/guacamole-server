@@ -18,13 +18,13 @@
  */
 
 #include "color.h"
-#include "common/surface.h"
 #include "config.h"
 #include "glyph.h"
 #include "rdp.h"
 
 #include <freerdp/freerdp.h>
 #include <guacamole/client.h>
+#include <guacamole/surface.h>
 #include <winpr/wtypes.h>
 
 #include <stdint.h>
@@ -98,11 +98,11 @@ BOOL guac_rdp_glyph_draw(rdpContext* context, const rdpGlyph* glyph,
 
     guac_client* client = ((rdp_freerdp_context*) context)->client;
     guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
-    guac_common_surface* current_surface = rdp_client->current_surface;
+    guac_surface* current_surface = rdp_client->current_surface;
     uint32_t fgcolor = rdp_client->glyph_color;
 
     /* Paint with glyph as mask */
-    guac_common_surface_paint(current_surface, x, y, ((guac_rdp_glyph*) glyph)->surface,
+    guac_surface_paint(current_surface, x, y, ((guac_rdp_glyph*) glyph)->surface,
                                (fgcolor & 0xFF0000) >> 16,
                                (fgcolor & 0x00FF00) >> 8,
                                 fgcolor & 0x0000FF);
@@ -144,7 +144,7 @@ BOOL guac_rdp_glyph_begindraw(rdpContext* context,
         /* Convert background color */
         bgcolor = guac_rdp_convert_color(context, bgcolor);
 
-        guac_common_surface_set(rdp_client->current_surface,
+        guac_surface_set(rdp_client->current_surface,
                 x, y, width, height,
                 (bgcolor & 0xFF0000) >> 16,
                 (bgcolor & 0x00FF00) >> 8,

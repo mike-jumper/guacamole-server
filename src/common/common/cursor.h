@@ -21,11 +21,10 @@
 #ifndef GUAC_COMMON_CURSOR_H
 #define GUAC_COMMON_CURSOR_H
 
-#include "surface.h"
-
 #include <cairo/cairo.h>
 #include <guacamole/client.h>
 #include <guacamole/socket.h>
+#include <guacamole/surface.h>
 #include <guacamole/user.h>
 
 /**
@@ -243,7 +242,7 @@ void guac_common_cursor_set_argb(guac_common_cursor* cursor, int hx, int hy,
  *     The surface containing the cursor image.
  */
 void guac_common_cursor_set_surface(guac_common_cursor* cursor, int hx, int hy,
-    guac_common_surface* surface);
+    guac_surface* surface);
 
 /**
  * Set the cursor of the remote display to the embedded "pointer" graphic. The

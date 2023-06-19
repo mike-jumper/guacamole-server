@@ -21,7 +21,6 @@
 
 #include "client.h"
 #include "common/iconv.h"
-#include "common/surface.h"
 #include "vnc.h"
 
 #include <cairo/cairo.h>
@@ -29,6 +28,7 @@
 #include <guacamole/layer.h>
 #include <guacamole/protocol.h>
 #include <guacamole/socket.h>
+#include <guacamole/surface.h>
 #include <rfb/rfbclient.h>
 #include <rfb/rfbproto.h>
 
@@ -129,7 +129,7 @@ void guac_vnc_update(rfbClient* client, int x, int y, int w, int h) {
             w, h, stride);
 
     /* Draw directly to default layer */
-    guac_common_surface_draw(vnc_client->display->default_surface,
+    guac_surface_draw(vnc_client->display->default_surface,
             x, y, surface);
 
     /* Free surface */
@@ -144,7 +144,7 @@ void guac_vnc_copyrect(rfbClient* client, int src_x, int src_y, int w, int h, in
     guac_vnc_client* vnc_client = (guac_vnc_client*) gc->data;
 
     /* Copy specified rectangle within default layer */
-    guac_common_surface_copy(vnc_client->display->default_surface,
+    guac_surface_copy(vnc_client->display->default_surface,
             src_x, src_y, w, h,
             vnc_client->display->default_surface, dest_x, dest_y);
 
@@ -198,7 +198,7 @@ rfbBool guac_vnc_malloc_framebuffer(rfbClient* rfb_client) {
 
     /* Resize surface */
     if (vnc_client->display != NULL)
-        guac_common_surface_resize(vnc_client->display->default_surface,
+        guac_surface_resize(vnc_client->display->default_surface,
                 rfb_client->width, rfb_client->height);
 
     /* Use original, wrapped proc */

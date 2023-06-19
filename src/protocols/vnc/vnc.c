@@ -45,6 +45,7 @@
 #include <guacamole/protocol.h>
 #include <guacamole/recording.h>
 #include <guacamole/socket.h>
+#include <guacamole/surface.h>
 #include <guacamole/timestamp.h>
 #include <guacamole/wol.h>
 #include <rfb/rfbclient.h>
@@ -513,7 +514,7 @@ void* guac_vnc_client_thread(void* data) {
             guac_client_abort(client, GUAC_PROTOCOL_STATUS_UPSTREAM_ERROR, "Connection closed.");
 
         /* Flush frame */
-        guac_common_surface_flush(vnc_client->display->default_surface);
+        guac_surface_flush(vnc_client->display->default_surface);
         guac_client_end_frame(client);
         guac_socket_flush(client->socket);
 

@@ -245,11 +245,13 @@ void guac_common_cursor_set_argb(guac_common_cursor* cursor, int hx, int hy,
 }
 
 void guac_common_cursor_set_surface(guac_common_cursor* cursor, int hx, int hy,
-    guac_common_surface* surface) {
+    guac_surface* surface) {
+
+    /* TODO */
 
     /* Set cursor to surface contents */
-    guac_common_cursor_set_argb(cursor, hx, hy, surface->buffer,
-            surface->width, surface->height, surface->stride);
+    /*guac_common_cursor_set_argb(cursor, hx, hy, surface->buffer,
+            surface->width, surface->height, surface->stride);*/
 
 }
 

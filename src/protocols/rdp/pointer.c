@@ -20,7 +20,6 @@
 #include "color.h"
 #include "common/cursor.h"
 #include "common/display.h"
-#include "common/surface.h"
 #include "gdi.h"
 #include "pointer.h"
 #include "rdp.h"
@@ -30,6 +29,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/gdi/gdi.h>
 #include <guacamole/client.h>
+#include <guacamole/surface.h>
 #include <winpr/crt.h>
 
 BOOL guac_rdp_pointer_new(rdpContext* context, rdpPointer* pointer) {
@@ -60,7 +60,7 @@ BOOL guac_rdp_pointer_new(rdpContext* context, rdpPointer* pointer) {
         pointer->width, pointer->height, 4*pointer->width);
 
     /* Send surface to buffer */
-    guac_common_surface_draw(buffer->surface, 0, 0, surface);
+    guac_surface_draw(buffer->surface, 0, 0, surface);
 
     /* Free surface */
     cairo_surface_destroy(surface);

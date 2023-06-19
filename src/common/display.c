@@ -19,10 +19,12 @@
 
 #include "common/cursor.h"
 #include "common/display.h"
-#include "common/surface.h"
 
 #include <guacamole/client.h>
+#include <guacamole/layer.h>
+#include <guacamole/protocol.h>
 #include <guacamole/socket.h>
+#include <guacamole/surface.h>
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -50,7 +52,7 @@ static void guac_common_display_dup_layers(guac_common_display_layer* layers,
 
     /* Synchronize all surfaces in given list */
     while (current != NULL) {
-        guac_common_surface_dup(current->surface, user, socket);
+        guac_surface_dup(current->surface, user, socket);
         current = current->next;
     }
 
@@ -80,7 +82,7 @@ static void guac_common_display_free_layers(guac_common_display_layer* layers,
         guac_layer* layer = current->layer;
 
         /* Free surface */
-        guac_common_surface_free(current->surface);
+        guac_surface_free(current->surface);
 
         /* Destroy layer within remotely-connected client */
         guac_protocol_send_dispose(client->socket, layer);
@@ -135,7 +137,7 @@ guac_common_display* guac_common_display_alloc(guac_client* client,
     /* Associate display with given client */
     display->client = client;
 
-    display->default_surface = guac_common_surface_alloc(client,
+    display->default_surface = guac_surface_alloc(client,
             client->socket, GUAC_DEFAULT_LAYER, width, height);
 
     /* No initial layers or buffers */
@@ -152,7 +154,7 @@ void guac_common_display_free(guac_common_display* display) {
     guac_common_cursor_free(display->cursor);
 
     /* Free default surface */
-    guac_common_surface_free(display->default_surface);
+    guac_surface_free(display->default_surface);
 
     /* Free all layers and buffers */
     guac_common_display_free_layers(display->buffers, display->client);
@@ -174,7 +176,7 @@ void guac_common_display_dup(guac_common_display* display, guac_user* user,
     guac_common_cursor_dup(display->cursor, user, socket);
 
     /* Synchronize default surface */
-    guac_common_surface_dup(display->default_surface, user, socket);
+    guac_surface_dup(display->default_surface, user, socket);
 
     /* Synchronize all layers and buffers */
     guac_common_display_dup_layers(display->layers, user, socket);
@@ -199,13 +201,13 @@ void guac_common_display_set_lossless(guac_common_display* display,
     /* Update losslessness of all allocated layers/buffers */
     guac_common_display_layer* current = display->layers;
     while (current != NULL) {
-        guac_common_surface_set_lossless(current->surface, lossless);
+        guac_surface_set_lossless(current->surface, lossless);
         current = current->next;
     }
 
     /* Update losslessness of default display layer (not included within layers
      * list) */
-    guac_common_surface_set_lossless(display->default_surface, lossless);
+    guac_surface_set_lossless(display->default_surface, lossless);
 
     pthread_mutex_unlock(&display->_lock);
 
@@ -219,11 +221,11 @@ void guac_common_display_flush(guac_common_display* display) {
 
     /* Flush all surfaces */
     while (current != NULL) {
-        guac_common_surface_flush(current->surface);
+        guac_surface_flush(current->surface);
         current = current->next;
     }
 
-    guac_common_surface_flush(display->default_surface);
+    guac_surface_flush(display->default_surface);
 
     pthread_mutex_unlock(&display->_lock);
 
@@ -251,7 +253,7 @@ void guac_common_display_flush(guac_common_display* display) {
  */
 static guac_common_display_layer* guac_common_display_add_layer(
         guac_common_display_layer** head, guac_layer* layer,
-        guac_common_surface* surface) {
+        guac_surface* surface) {
 
     guac_common_display_layer* old_head = *head;
 
@@ -313,11 +315,11 @@ guac_common_display_layer* guac_common_display_alloc_layer(
     guac_layer* layer = guac_client_alloc_layer(display->client);
 
     /* Allocate corresponding surface */
-    guac_common_surface* surface = guac_common_surface_alloc(display->client,
+    guac_surface* surface = guac_surface_alloc(display->client,
             display->client->socket, layer, width, height);
 
     /* Apply current display losslessness */
-    guac_common_surface_set_lossless(surface, display->lossless);
+    guac_surface_set_lossless(surface, display->lossless);
 
     /* Add layer and surface to list */
     guac_common_display_layer* display_layer =
@@ -337,11 +339,11 @@ guac_common_display_layer* guac_common_display_alloc_buffer(
     guac_layer* buffer = guac_client_alloc_buffer(display->client);
 
     /* Allocate corresponding surface */
-    guac_common_surface* surface = guac_common_surface_alloc(display->client,
+    guac_surface* surface = guac_surface_alloc(display->client,
             display->client->socket, buffer, width, height);
 
     /* Apply current display losslessness */
-    guac_common_surface_set_lossless(surface, display->lossless);
+    guac_surface_set_lossless(surface, display->lossless);
 
     /* Add buffer and surface to list */
     guac_common_display_layer* display_layer =
@@ -361,7 +363,7 @@ void guac_common_display_free_layer(guac_common_display* display,
     guac_common_display_remove_layer(&display->layers, display_layer);
 
     /* Free associated layer and surface */
-    guac_common_surface_free(display_layer->surface);
+    guac_surface_free(display_layer->surface);
     guac_client_free_layer(display->client, display_layer->layer);
 
     /* Free list element */
@@ -380,7 +382,7 @@ void guac_common_display_free_buffer(guac_common_display* display,
     guac_common_display_remove_layer(&display->buffers, display_buffer);
 
     /* Free associated layer and surface */
-    guac_common_surface_free(display_buffer->surface);
+    guac_surface_free(display_buffer->surface);
     guac_client_free_buffer(display->client, display_buffer->layer);
 
     /* Free list element */

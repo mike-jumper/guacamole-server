@@ -21,16 +21,16 @@
 #define GUAC_COMMON_DISPLAY_H
 
 #include "cursor.h"
-#include "surface.h"
 
 #include <guacamole/client.h>
 #include <guacamole/socket.h>
+#include <guacamole/surface.h>
 
 #include <pthread.h>
 
 /**
  * A list element representing a pairing of a Guacamole layer with a
- * corresponding guac_common_surface which wraps that layer. Adjacent layers
+ * corresponding guac_surface which wraps that layer. Adjacent layers
  * within the same list are pointed to with traditional prev/next pointers. The
  * order of layers in lists need not correspond in any way to the natural
  * ordering of those layers' indexes nor their stacking order (Z-order) within
@@ -48,7 +48,7 @@ struct guac_common_display_layer {
     /**
      * The surface which wraps the associated layer.
      */
-    guac_common_surface* surface;
+    guac_surface* surface;
 
     /**
      * The layer immediately prior to this layer within the list containing
@@ -78,7 +78,7 @@ typedef struct guac_common_display {
     /**
      * The default surface of the client display.
      */
-    guac_common_surface* default_surface;
+    guac_surface* default_surface;
 
     /**
      * Client-wide cursor, synchronized across all users.
@@ -245,7 +245,7 @@ void guac_common_display_free_buffer(guac_common_display* display,
  * restore the default policy.
  *
  * Note that this can also be adjusted on a per-layer / per-buffer basis with
- * guac_common_surface_set_lossless().
+ * guac_surface_set_lossless().
  *
  * @param display
  *     The display to modify.
