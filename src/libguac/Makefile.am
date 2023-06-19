@@ -65,6 +65,9 @@ libguacinc_HEADERS =                  \
     guacamole/socket.h                \
     guacamole/socket-fntypes.h        \
     guacamole/socket-types.h          \
+    guacamole/surface-constants.h     \
+    guacamole/surface-types.h         \
+    guacamole/surface.h               \
     guacamole/stream.h                \
     guacamole/stream-types.h          \
     guacamole/string.h                \
@@ -85,6 +88,8 @@ noinst_HEADERS =      \
     palette.h         \
     user-handlers.h   \
     raw_encoder.h     \
+    surface-priv.h    \
+    surface-tile.h    \
     wait-fd.h
 
 libguac_la_SOURCES =   \
@@ -109,6 +114,8 @@ libguac_la_SOURCES =   \
     socket-nest.c      \
     socket-tee.c       \
     string.c           \
+    surface.c          \
+    surface-tile.c     \
     timestamp.c        \
     unicode.c          \
     user.c             \
