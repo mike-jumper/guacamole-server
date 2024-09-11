@@ -107,6 +107,13 @@ typedef struct guac_rdp_client {
     guac_display_layer* current_surface;
 
     /**
+     * The current, in-progress paint operation, as signalled by FreeRDP's
+     * "BeginPaint" callback. Once the paint operation is complete (signalled
+     * by "EndPaint"), this will be NULL.
+     */
+    guac_display_layer_raw_context* current_paint;
+
+    /**
      * Whether the RDP server has reported that a new frame is in progress, and
      * we are now receiving updates relevant to that frame.
      */

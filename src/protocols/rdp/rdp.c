@@ -214,6 +214,7 @@ static BOOL rdp_freerdp_pre_connect(freerdp* instance) {
 
     /* Set up GDI */
     GUAC_RDP_CONTEXT(instance)->update->DesktopResize = guac_rdp_gdi_desktop_resize;
+    GUAC_RDP_CONTEXT(instance)->update->BeginPaint = guac_rdp_gdi_begin_paint;
     GUAC_RDP_CONTEXT(instance)->update->EndPaint = guac_rdp_gdi_end_paint;
 
     GUAC_RDP_CONTEXT(instance)->update->SurfaceFrameMarker = guac_rdp_gdi_surface_frame_marker;
@@ -667,6 +668,18 @@ static int guac_rdp_handle_connection(guac_client* client) {
     freerdp_disconnect(rdp_inst);
     pthread_mutex_unlock(&(rdp_client->message_lock));
 
+    /* Any outstanding paint operation must have completed by now (we must do
+     * this before freeing FreeRDP's GDI as the guac_display will have a
+     * reference to the GDI's primary_buffer) */
+    if (rdp_client->current_paint) {
+        guac_display_layer_close_raw(guac_display_default_layer(rdp_client->display), rdp_client->current_paint);
+        rdp_client->current_paint = NULL;
+    }
+
+    /* Free display */
+    guac_display_free(rdp_client->display);
+    rdp_client->display = NULL;
+
     /* Clean up FreeRDP internal GDI implementation */
     gdi_free(rdp_inst);
 
@@ -684,10 +697,6 @@ static int guac_rdp_handle_connection(guac_client* client) {
     /* Free RDP keyboard state */
     guac_rdp_keyboard_free(rdp_client->keyboard);
     rdp_client->keyboard = NULL;
-
-    /* Free display */
-    guac_display_free(rdp_client->display);
-    rdp_client->display = NULL;
 
     guac_rwlock_release_lock(&(rdp_client->lock));
 
