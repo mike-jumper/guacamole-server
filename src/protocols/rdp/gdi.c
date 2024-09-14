@@ -81,18 +81,10 @@ BOOL guac_rdp_gdi_begin_paint(rdpContext* context) {
     guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
     rdpGdi* gdi = context->gdi;
 
-    GUAC_ASSERT(rdp_client->current_paint == NULL);
-
-    guac_display_layer* default_layer =
-        guac_display_default_layer(rdp_client->display);
-
-    guac_display_layer_raw_context* current_paint =
-        guac_display_layer_open_raw(default_layer);
-    current_paint->buffer = gdi->primary_buffer;
-    current_paint->stride = gdi->stride;
-    guac_rect_init(&current_paint->bounds, 0, 0, gdi->width, gdi->height);
-
-    rdp_client->current_paint = current_paint;
+    guac_display_layer_raw_context* current_context = rdp_client->current_context;
+    current_context->buffer = gdi->primary_buffer;
+    current_context->stride = gdi->stride;
+    guac_rect_init(&current_context->bounds, 0, 0, gdi->width, gdi->height);
 
     return TRUE;
 
@@ -104,12 +96,7 @@ BOOL guac_rdp_gdi_end_paint(rdpContext* context) {
     guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
     rdpGdi* gdi = context->gdi;
 
-    GUAC_ASSERT(rdp_client->current_paint != NULL);
-    guac_display_layer_raw_context* current_paint = rdp_client->current_paint;
-    rdp_client->current_paint = NULL;
-
-    guac_display_layer* default_layer =
-        guac_display_default_layer(rdp_client->display);
+    guac_display_layer_raw_context* current_context = rdp_client->current_context;
 
     /* Ignore paint if GDI output is suppressed */
     if (gdi->suppressOutput)
@@ -126,12 +113,11 @@ BOOL guac_rdp_gdi_end_paint(rdpContext* context) {
 
     guac_rect dst_rect;
     guac_rect_init(&dst_rect, x, y, w, h);
-    guac_rect_constrain(&dst_rect, &current_paint->bounds);
+    guac_rect_constrain(&dst_rect, &current_context->bounds);
 
-    guac_rect_extend(&current_paint->dirty, &dst_rect);
+    guac_rect_extend(&current_context->dirty, &dst_rect);
 
 paint_complete:
-    guac_display_layer_close_raw(default_layer, current_paint);
     return TRUE;
 
 }
@@ -146,27 +132,19 @@ BOOL guac_rdp_gdi_desktop_resize(rdpContext* context) {
     int width = guac_rdp_get_width(context->instance);
     int height = guac_rdp_get_height(context->instance);
 
-    /* It's not expected that a resize will be requested by FreeRDP in the
-     * middle of a paint operation, but if this does happen we incorporate the
-     * resize into that operation */
-    guac_display_layer_raw_context* current_paint = rdp_client->current_paint;
-    if (current_paint == NULL)
-        current_paint = guac_display_layer_open_raw(default_layer);
+    guac_display_layer_raw_context* current_context = rdp_client->current_context;
 
+    /* Resize FreeRDP's GDI buffer */
     BOOL retval = gdi_resize(context->gdi, width, height);
     GUAC_ASSERT(gdi->primary_buffer != NULL);
 
     /* Update our reference to the GDI buffer, as well as any structural
      * details, which may now all be different */
-    current_paint->buffer = gdi->primary_buffer;
-    current_paint->stride = gdi->stride;
-    guac_rect_init(&current_paint->bounds, 0, 0, gdi->width, gdi->height);
+    current_context->buffer = gdi->primary_buffer;
+    current_context->stride = gdi->stride;
+    guac_rect_init(&current_context->bounds, 0, 0, gdi->width, gdi->height);
 
-    /* There's no need to close the context if we are just adding to an
-     * in-progress paint operation */
-    if (current_paint != rdp_client->current_paint)
-        guac_display_layer_close_raw(default_layer, current_paint);
-
+    /* Resize layer to match new display dimensions and underlying buffer */
     guac_display_layer_resize(default_layer, gdi->width, gdi->height);
     guac_client_log(client, GUAC_LOG_DEBUG, "Server resized display to %ix%i",
             gdi->width, gdi->height);

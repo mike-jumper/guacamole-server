@@ -107,11 +107,13 @@ typedef struct guac_rdp_client {
     guac_display_layer* current_surface;
 
     /**
-     * The current, in-progress paint operation, as signalled by FreeRDP's
-     * "BeginPaint" callback. Once the paint operation is complete (signalled
-     * by "EndPaint"), this will be NULL.
+     * The current raw context that can be used to draw to Guacamole's default
+     * layer. This context is obtained prior to handling any events/messages
+     * within FreeRDP and closed when FreeRDP is done handling those
+     * events/messages. If event handling is not currently underway, this will
+     * be NULL.
      */
-    guac_display_layer_raw_context* current_paint;
+    guac_display_layer_raw_context* current_context;
 
     /**
      * Whether the RDP server has reported that a new frame is in progress, and

@@ -466,6 +466,41 @@ static int rdp_guac_client_wait_for_messages(guac_client* client,
 }
 
 /**
+ * Handles any queued RDP-related events, including inbound RDP messages that
+ * have been received, updating the Guacamole display accordingly.
+ *
+ * @param rdp_client
+ *     The guac_rdp_client of the RDP connection whose current messages should
+ *     be handled.
+ *
+ * @return
+ *     True (non-zero) if messages were handled successfully, false (zero)
+ *     otherwise.
+ */
+static int guac_rdp_handle_events(guac_rdp_client* rdp_client) {
+
+    freerdp* rdp_inst = rdp_client->rdp_inst;
+    guac_display_layer* default_layer = guac_display_default_layer(rdp_client->display);
+
+    /* All potential drawing operations must occur while holding an open context */
+    guac_display_layer_raw_context* context = guac_display_layer_open_raw(default_layer);
+    rdp_client->current_context = context;
+
+    /* Actually handle messages (this may result in drawing to the
+     * guac_display, resizing the display buffer, etc.) */
+    pthread_mutex_lock(&(rdp_client->message_lock));
+    int retval = freerdp_check_event_handles(GUAC_RDP_CONTEXT(rdp_inst));
+    pthread_mutex_unlock(&(rdp_client->message_lock));
+
+    /* There will be no further drawing operations */
+    guac_display_layer_close_raw(default_layer, context);
+    rdp_client->current_context = NULL;
+
+    return retval;
+
+}
+
+/**
  * Connects to an RDP server as described by the guac_rdp_settings structure
  * associated with the given client, allocating and freeing all objects
  * directly related to the RDP connection. It is expected that all objects
@@ -590,13 +625,9 @@ static int guac_rdp_handle_connection(guac_client* client) {
             do {
 
                 /* Handle any queued FreeRDP events (this may result in RDP
-                 * messages being sent) */
-                pthread_mutex_lock(&(rdp_client->message_lock));
-                int event_result = freerdp_check_event_handles(GUAC_RDP_CONTEXT(rdp_inst));
-                pthread_mutex_unlock(&(rdp_client->message_lock));
-
-                /* Abort if FreeRDP event handling fails */
-                if (!event_result) {
+                 * messages being sent), aborting if FreeRDP event handling
+                 * fails */
+                if (!guac_rdp_handle_events(rdp_client)) {
                     wait_result = -1;
                     break;
                 }
@@ -667,14 +698,6 @@ static int guac_rdp_handle_connection(guac_client* client) {
     pthread_mutex_lock(&(rdp_client->message_lock));
     freerdp_disconnect(rdp_inst);
     pthread_mutex_unlock(&(rdp_client->message_lock));
-
-    /* Any outstanding paint operation must have completed by now (we must do
-     * this before freeing FreeRDP's GDI as the guac_display will have a
-     * reference to the GDI's primary_buffer) */
-    if (rdp_client->current_paint) {
-        guac_display_layer_close_raw(guac_display_default_layer(rdp_client->display), rdp_client->current_paint);
-        rdp_client->current_paint = NULL;
-    }
 
     /* Free display */
     guac_display_free(rdp_client->display);
