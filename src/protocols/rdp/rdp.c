@@ -480,21 +480,12 @@ static int rdp_guac_client_wait_for_messages(guac_client* client,
 static int guac_rdp_handle_events(guac_rdp_client* rdp_client) {
 
     freerdp* rdp_inst = rdp_client->rdp_inst;
-    guac_display_layer* default_layer = guac_display_default_layer(rdp_client->display);
-
-    /* All potential drawing operations must occur while holding an open context */
-    guac_display_layer_raw_context* context = guac_display_layer_open_raw(default_layer);
-    rdp_client->current_context = context;
 
     /* Actually handle messages (this may result in drawing to the
      * guac_display, resizing the display buffer, etc.) */
     pthread_mutex_lock(&(rdp_client->message_lock));
     int retval = freerdp_check_event_handles(GUAC_RDP_CONTEXT(rdp_inst));
     pthread_mutex_unlock(&(rdp_client->message_lock));
-
-    /* There will be no further drawing operations */
-    guac_display_layer_close_raw(default_layer, context);
-    rdp_client->current_context = NULL;
 
     return retval;
 
@@ -699,12 +690,12 @@ static int guac_rdp_handle_connection(guac_client* client) {
     freerdp_disconnect(rdp_inst);
     pthread_mutex_unlock(&(rdp_client->message_lock));
 
+    /* Clean up FreeRDP internal GDI implementation */
+    gdi_free(rdp_inst);
+
     /* Free display */
     guac_display_free(rdp_client->display);
     rdp_client->display = NULL;
-
-    /* Clean up FreeRDP internal GDI implementation */
-    gdi_free(rdp_inst);
 
     /* Clean up RDP client context */
     freerdp_context_free(rdp_inst);
