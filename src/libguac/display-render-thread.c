@@ -35,15 +35,14 @@
  */
 #define GUAC_DISPLAY_RENDER_THREAD_MAX_FRAME_DURATION 100
 
-/**
- * The minimum duration of a frame in milliseconds. This ensures we don't start
- * flushing a ton of tiny frames if a remote desktop server provides no frame
- * boundaries and streams data inconsistently enough that timing would suggest
- * frame boundaries in the middle of a frame.
- *
- * The current value of 10 is equivalent to 100 frames per second.
+/** The minimum duration of a frame in milliseconds. This is currently set to 0
+ * to reduce latency to the absolute minimum, however non-zero values have
+ * historically been used in the past to ensure that we don't start flushing a
+ * ton of tiny frames if a remote desktop server provides no frame boundaries
+ * and streams data inconsistently enough that timing would suggest frame
+ * boundaries in the middle of a frame.
  */
-#define GUAC_DISPLAY_RENDER_THREAD_MIN_FRAME_DURATION 10
+#define GUAC_DISPLAY_RENDER_THREAD_MIN_FRAME_DURATION 0
 
 /**
  * The start routine for the display render thread, consisting of a single
@@ -136,7 +135,7 @@ static void* guac_display_render_loop(void* data) {
             if (required_wait > 0) {
                 guac_client_log(client, GUAC_LOG_TRACE,
                         "Waiting %ims to compensate for client-side "
-                        "processing delays.\n", required_wait);
+                        "processing delays.", required_wait);
                 guac_timestamp_msleep(required_wait);
             }
 
@@ -163,12 +162,12 @@ static void* guac_display_render_loop(void* data) {
                     | GUAC_DISPLAY_RENDER_THREAD_STATE_FRAME_MODIFIED, 0));
 
         /* Pass on cursor state for consumption by guac_display frame flush */
-        guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+        guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
         display->pending_frame.cursor_user = cursor_state.user;
         display->pending_frame.cursor_x = cursor_state.x;
         display->pending_frame.cursor_y = cursor_state.y;
         display->pending_frame.cursor_mask = cursor_state.mask;
-        guac_rwlock_release_lock(&display->pending_frame.lock);
+        guac_flag_unlock(&display->pending_state);
 
         guac_display_end_multiple_frames(display, rendered_frames);
 
