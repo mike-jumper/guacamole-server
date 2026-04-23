@@ -24,6 +24,7 @@
 #include "guacamole/error.h"
 #include "guacamole/protocol.h"
 #include "guacamole/stream.h"
+#include "image-util.h"
 #include "palette.h"
 
 #include <cairo/cairo.h>
@@ -231,21 +232,17 @@ int guac_jpeg_write(guac_socket* socket, guac_stream* stream,
         /* In Turbo JPEG we can use the raw BGRx scanline  */
         row_pointer[0] = &data[row_offset];
 #else
-        /* For standard JPEG libraries we have to convert the
-         * scanline from 24 bit (4 byte) BGRx to 24 bit (3 byte) RGB */
-        unsigned char *inptr = data + row_offset;
-        unsigned char *outptr = scanline_data;
-
-        for (int x = 0; x < width; ++x) {
-
-            outptr[2] = *inptr++; /* B */
-            outptr[1] = *inptr++; /* G */
-            outptr[0] = *inptr++; /* R */
-            inptr++; /* skip the upper byte (x/A) */
-            outptr += 3;
-
-        }
-
+        /* For standard JPEG libraries we have to convert the scanline
+         * from 24-bit (4-byte) BGRx to 24-bit (3-byte) RGB. The shared
+         * image-util helper handles 4 pixels per iteration via a single
+         * byte-shuffle (PSHUFB on SSSE3+ / VTBL on NEON) so the only
+         * manual per-pixel work on the non-turbo path compiles to a
+         * tight in-register loop rather than a four-load-three-store
+         * scalar per-pixel loop. libjpeg-turbo's own DCT/Huffman stages
+         * already use SIMD internally; this brings the input transfer
+         * up to parity. */
+        guac_image_bgrx_to_rgb_row(scanline_data,
+                data + row_offset, width);
         row_pointer[0] = scanline_data;
 #endif
 

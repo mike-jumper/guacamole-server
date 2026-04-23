@@ -23,6 +23,7 @@
 #include "guacamole/client.h"
 #include "guacamole/object.h"
 #include "guacamole/protocol.h"
+#include "guacamole/socket.h"
 #include "guacamole/stream.h"
 #include "guacamole/string.h"
 #include "guacamole/timestamp.h"
@@ -117,6 +118,108 @@ int __guac_handle_sync(guac_user* user, int argc, char** argv) {
     /* Only update lag calculations if timestamp is sane */
     if (timestamp >= user->last_received_timestamp) {
 
+        /* Look up the ring entry for the sync this ack is for, and
+         * accumulate the per-frame byte counts and per-frame
+         * render times from the oldest live entry through the match
+         * (inclusive). The byte sum is the numerator for the
+         * network-throughput EMA; the render-time sum is the
+         * denominator - server-side active pipeline duration
+         * (encode + socket-write), which TCP backpressure naturally
+         * extends on a bandwidth-bound link. This replaces an
+         * earlier ack-interval denominator that included pre-
+         * pipeline idle time (outer wait, modification
+         * accumulation, pacing wait) and fed a feedback loop with
+         * pacing decisions.
+         *
+         * guac_client_end_multiple_frames appends one history entry
+         * per emit (strictly-ascending timestamps within the live
+         * range [read_index, write_index)); a successful match
+         * advances read_index past the match, implicitly dropping
+         * all older entries (acks are monotonic, so no future ack
+         * will need them).
+         *
+         * Linear scan with early-exit is the right choice here over
+         * bsearch: in steady-state lockstep pacing the match is at
+         * read_index (the oldest outstanding sync is the next one
+         * to get acked), so the scan terminates on its first
+         * compare - vs bsearch's unconditional log2(N) probes. The
+         * ascending-timestamp invariant also lets us early-exit on
+         * the first entry past the ack's timestamp, which handles
+         * the overflow and never-tracked cases cheaply. */
+        size_t frame_bytes_sum = 0;
+        int render_time_sum_ms = 0;
+        int have_sample = 0;
+
+        /* "Consecutive" here means: this ack matches the FIRST entry
+         * in the live range (match_n == 0), i.e. no previously-
+         * emitted sync was skipped between the last ack we processed
+         * and this one. When the client batches multiple syncs into
+         * one ack - it acks only the latest sync timestamp it has
+         * seen - the match lands further into the live range and
+         * the byte sum spans multiple frames while the per-frame
+         * client-processing-lag denominator reflects only one, so
+         * we don't produce a processing-throughput sample for that
+         * case. The network throughput sample stays valid:
+         * bytes/ack_interval averages correctly over any window. */
+        int have_consecutive_sample = 0;
+
+        pthread_mutex_lock(&user->sync_emit_lock);
+
+        /* Walk the live range [read_index, write_index) by length,
+         * not by "i != write_index". A modular-index loop is fragile
+         * near uint64 wrap - if the counters were close to UINT64_MAX
+         * and wrapped across the boundary, i would wrap to 0 before
+         * reaching write_index and the loop would spin for up to
+         * ~UINT64_MAX extra iterations. Computing the count via
+         * unsigned subtraction first gives a bounded small integer
+         * (<= GUAC_USER_SYNC_EMIT_HISTORY_SIZE by invariant) and a
+         * termination condition that doesn't depend on wrap behaviour.
+         *
+         * Physical slot access still uses (idx & MASK), where idx
+         * can mathematically wrap without issue - only the low bits
+         * matter for addressing. */
+        uint64_t read_idx = user->sync_emit_read_index;
+        uint64_t count = user->sync_emit_write_index - read_idx;
+
+        for (uint64_t n = 0; n < count; n++) {
+
+            uint64_t idx = read_idx + n;
+            guac_user_sync_emit_record* rec =
+                    &user->sync_emit_history[idx & GUAC_USER_SYNC_EMIT_HISTORY_MASK];
+
+            /* Accumulate per-frame bytes and per-frame render times
+             * as we walk so a match at position n yields totals
+             * across all frames from the last ack through this one.
+             * Entries past the match (future syncs not yet acked)
+             * are left in the live range for subsequent acks. */
+            frame_bytes_sum += rec->bytes;
+            render_time_sum_ms += rec->render_time_ms;
+
+            if (rec->timestamp == timestamp) {
+                have_sample = 1;
+                have_consecutive_sample = (n == 0);
+                /* Advance read_index past the match. The matched
+                 * entry's slot (and any intervening older entries
+                 * for out-of-order acks) stays in place physically
+                 * but is now outside the live range and will be
+                 * overwritten by future emits. Subtract the walked
+                 * entries from the cached live-range sum since
+                 * they're now out-of-range. */
+                user->sync_emit_read_index = idx + 1;
+                user->sum_ring_bytes -= frame_bytes_sum;
+                break;
+            }
+
+            /* Ascending invariant: once we see a timestamp past the
+             * ack's, the ack's sync isn't in the live range
+             * (displaced by overflow, or never tracked). Abort. */
+            if (rec->timestamp > timestamp)
+                break;
+
+        }
+
+        pthread_mutex_unlock(&user->sync_emit_lock);
+
         /* Update stored timestamp */
         user->last_received_timestamp = timestamp;
 
@@ -149,13 +252,137 @@ int __guac_handle_sync(guac_user* user, int argc, char** argv) {
 
         user->processing_lag = processing_lag;
 
+        /* Update network-throughput EMA. The sample approximates
+         * the effective emit rate - the rate at which the server
+         * can actually push frame bytes onto the wire:
+         *
+         *     throughput = frame_bytes_sum / render_time_sum_ms
+         *
+         *   - frame_bytes_sum is the sum of per-frame byte counts
+         *     from the ring entries between (and including) the
+         *     previous acked sync and this one. Those bytes are
+         *     exactly what flowed between the two syncs: acked
+         *     content, no more, no less.
+         *
+         *   - render_time_sum_ms is the sum of server-side active
+         *     pipeline durations for those same frames. Each
+         *     render_time is measured from flush-start (render
+         *     thread calling guac_display_end_multiple_frames) to
+         *     last-worker sync emit - pure encode + socket-write
+         *     time, excluding all pre-pipeline idle (outer wait,
+         *     modification accumulation, pre-encoding pacing wait).
+         *
+         * Why NOT the ack-to-ack interval? Because it includes the
+         * pre-pipeline idle, which then flows into the pacing-wait
+         * decision for the next frame, which extends the next ack-
+         * to-ack interval, which further depresses the sample - a
+         * self-reinforcing feedback loop that collapses the EMA
+         * toward the min-throughput floor over a few dozen frames.
+         *
+         * Why this works:
+         *
+         *   - Bandwidth-bound link: TCP backpressure extends
+         *     socket_write time, so render_time_sum_ms tracks
+         *     frame_bytes_sum / net_rate and the EMA converges to
+         *     actual net_rate.
+         *
+         *   - Fast link: render_time_sum_ms is encode-CPU-bound,
+         *     so the EMA reflects server encode rate - the useful
+         *     upper bound for pacing in that regime (we can't
+         *     drive the client faster than we can encode anyway).
+         *
+         * First sample seeds the EMA directly; subsequent samples
+         * fold in with a smoothing factor of 1/4.
+         *
+         * Samples are skipped when: (a) we can't match the ack's
+         * timestamp to a tracked sync emit (have_sample == 0), or
+         * (b) render_time_sum_ms is not positive (no display-
+         * pipeline record available for this sync; shouldn't
+         * happen in display-driven emission but guarded
+         * defensively). */
+        if (have_sample && render_time_sum_ms > 0) {
+
+            int sample = (int) (frame_bytes_sum
+                    / (size_t) render_time_sum_ms);
+
+            if (user->bytes_per_ms == 0)
+                user->bytes_per_ms = sample;
+            else
+                user->bytes_per_ms =
+                    (3 * user->bytes_per_ms + sample) / 4;
+
+        }
+
+        /* Update processing-throughput EMA. This sample measures
+         * how fast the client can decode and render a single
+         * frame's payload:
+         *
+         *     processing_throughput = frame_bytes
+         *                             / frame_processing_lag
+         *
+         *   - frame_bytes is the byte count of this ack's single
+         *     acked frame (the sum collapses to one entry when the
+         *     match is at read_index).
+         *
+         *   - frame_processing_lag is the portion of the
+         *     round-trip spent on the client after the sync
+         *     arrived, estimated above as frame_duration minus the
+         *     rolling RTT baseline. It tracks client-side
+         *     decode+render time up to smoothing noise.
+         *
+         * Only produced when have_consecutive_sample is set: if
+         * the client batches multiple syncs into one ack, the byte
+         * sum spans multiple frames but frame_processing_lag
+         * reflects only the last one, so the ratio would be
+         * meaningless. Batched acks still produce valid
+         * network-throughput samples above (bytes/ack_interval
+         * averages correctly over any window); the skip only
+         * affects the processing EMA.
+         *
+         * First sample seeds the EMA directly; subsequent samples
+         * fold in with a smoothing factor of 1/4. */
+        if (have_consecutive_sample
+                && user->last_acked_sync_receipt_time != 0
+                && frame_processing_lag > 0) {
+
+            int proc_sample =
+                    (int) (frame_bytes_sum / (size_t) frame_processing_lag);
+
+            if (user->processing_bytes_per_ms == 0)
+                user->processing_bytes_per_ms = proc_sample;
+            else
+                user->processing_bytes_per_ms =
+                    (3 * user->processing_bytes_per_ms + proc_sample) / 4;
+
+        }
+
+        /* Advance the acked receipt-time baseline regardless of
+         * whether a sample was produced - the next sample measures
+         * bytes and interval relative to this ack, even if this ack
+         * itself didn't contribute a sample. Skipping the update
+         * when no sample is produced would cause the next sample's
+         * interval to span multiple frames and misrepresent the
+         * rate. */
+        if (have_sample)
+            user->last_acked_sync_receipt_time = current;
+
     }
 
     /* Log received timestamp and calculated lag (at TRACE level only) */
     guac_user_log(user, GUAC_LOG_TRACE,
             "User confirmation of frame %" PRIu64 "ms received "
-            "at %" PRIu64 "ms (processing_lag=%ims, estimated_rtt=%ims)",
-            timestamp, current, user->processing_lag, user->last_frame_duration);
+            "at %" PRIu64 "ms (processing_lag=%ims, estimated_rtt=%ims, "
+            "net_throughput=%ikB/s, proc_throughput=%ikB/s)",
+            timestamp, current, user->processing_lag, user->last_frame_duration,
+            user->bytes_per_ms, user->processing_bytes_per_ms);
+
+    /* Signal sync receipt so any rate-limiting consumer timed-waiting
+     * on the client-level sync_state flag wakes up and re-measures
+     * with the fresh processing_lag / throughput numbers just written
+     * above. The flag is a pure event - consumers clear it before
+     * each wait, so setting it here unconditionally is correct even
+     * across back-to-back syncs. */
+    guac_flag_set(&user->client->sync_state, GUAC_CLIENT_SYNC_RECEIVED);
 
     if (user->sync_handler)
         return user->sync_handler(user, timestamp);

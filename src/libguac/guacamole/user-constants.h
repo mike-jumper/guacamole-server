@@ -64,5 +64,35 @@
  */
 #define GUAC_USER_STREAM_INDEX_MIMETYPE "application/vnd.glyptodon.guacamole.stream-index+json"
 
+/**
+ * Maximum number of outstanding (sent but not yet acknowledged) server
+ * syncs tracked per-user for throughput-calculation purposes. Each
+ * emitted sync adds a record carrying the cumulative byte count on
+ * the user's socket at emit time; matching sync acks look the record
+ * up by timestamp to anchor the throughput sample's upper byte bound.
+ *
+ * MUST be a power of two - the history is a ring buffer whose
+ * physical slot is derived from a monotonic index via bitmask-and
+ * with GUAC_USER_SYNC_EMIT_HISTORY_MASK.
+ *
+ * Sized for ~1 second of in-flight syncs at a 60 Hz frame rate with a
+ * generous margin - enough to cover any realistic RTT plus client
+ * processing delay without losing samples. When the history is full a
+ * newly-emitted sync displaces the oldest un-acked entry; acks that
+ * would have matched the displaced entry simply skip the throughput
+ * sample (one bad or missing sample is strictly better than a
+ * hang or an incorrect calculation).
+ */
+#define GUAC_USER_SYNC_EMIT_HISTORY_SIZE 64
+
+/**
+ * Bitmask that reduces a monotonic
+ * guac_user::sync_emit_write_index / sync_emit_read_index value to
+ * the corresponding physical slot within
+ * guac_user::sync_emit_history. Derived from
+ * GUAC_USER_SYNC_EMIT_HISTORY_SIZE, which must be a power of two.
+ */
+#define GUAC_USER_SYNC_EMIT_HISTORY_MASK (GUAC_USER_SYNC_EMIT_HISTORY_SIZE - 1)
+
 #endif
 

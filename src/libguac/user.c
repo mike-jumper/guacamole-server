@@ -55,7 +55,21 @@ guac_user* guac_user_alloc(void) {
     user->last_received_timestamp = guac_timestamp_current();
     user->last_frame_duration = 0;
     user->processing_lag = 0;
+    user->last_sync_emit_cumulative_bytes = 0;
+    user->sum_ring_bytes = 0;
+    user->last_acked_sync_receipt_time = 0;
+    user->sync_emit_write_index = 0;
+    user->sync_emit_read_index = 0;
+    user->bytes_per_ms = 0;
+    user->processing_bytes_per_ms = 0;
     user->active = 1;
+
+    /* Serializes append-to-history (by whichever thread calls
+     * guac_client_end_multiple_frames) and search/truncate-on-ack
+     * (by this user's receive thread, via __guac_handle_sync).
+     * Critical sections run a small memmove over the history plus a
+     * handful of scalar ops. */
+    pthread_mutex_init(&user->sync_emit_lock, NULL);
 
     /* Allocate stream pool. Use GUAC_USER_MAX_STREAMS as min_size to prefer
      * new indices over reused ones up to the maximum, avoiding race conditions
@@ -98,6 +112,12 @@ void guac_user_free(guac_user* user) {
 
     /* Free object pool */
     guac_pool_free(user->__object_pool);
+
+    /* Release sync-emit mutex. No further users of this mutex should
+     * exist at this point - the user's receive thread has already been
+     * joined and any frame-emit thread that might still reference the
+     * user has been detached via guac_client_remove_user. */
+    pthread_mutex_destroy(&user->sync_emit_lock);
 
     /* Clean up user */
     guac_mem_free(user->user_id);
@@ -262,8 +282,10 @@ void guac_user_stream_png(guac_user* user, guac_socket* socket,
     /* Declare stream as containing image data */
     guac_protocol_send_img(socket, stream, mode, layer, "image/png", x, y);
 
-    /* Write PNG data */
-    guac_png_write(socket, stream, surface);
+    /* Write PNG data. This entry point has no content-nature
+     * information available, so pass UNKNOWN to let the encoder
+     * fall back on general-purpose defaults. */
+    guac_png_write(socket, stream, surface, GUAC_IMAGE_HINT_UNKNOWN);
 
     /* Terminate stream */
     guac_protocol_send_end(socket, stream);
@@ -296,7 +318,8 @@ void guac_user_stream_jpeg(guac_user* user, guac_socket* socket,
 
 void guac_user_stream_webp(guac_user* user, guac_socket* socket,
         guac_composite_mode mode, const guac_layer* layer, int x, int y,
-        cairo_surface_t* surface, int quality, int lossless) {
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless) {
 
 #ifdef ENABLE_WEBP
     /* Allocate new stream for image */
@@ -305,8 +328,11 @@ void guac_user_stream_webp(guac_user* user, guac_socket* socket,
     /* Declare stream as containing image data */
     guac_protocol_send_img(socket, stream, mode, layer, "image/webp", x, y);
 
-    /* Write WebP data */
-    guac_webp_write(socket, stream, surface, quality, lossless);
+    /* Write WebP data. No content-nature hint available at this
+     * entry point; UNKNOWN is the safe default and WebP ignores the
+     * hint today anyway. */
+    guac_webp_write(socket, stream, surface, quality, target_bytes,
+            lossless, GUAC_IMAGE_HINT_UNKNOWN);
 
     /* Terminate stream */
     guac_protocol_send_end(socket, stream);

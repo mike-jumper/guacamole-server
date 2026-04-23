@@ -341,5 +341,60 @@ typedef enum guac_message_type {
 
 } guac_message_type;
 
+/**
+ * Hint describing the nature of image content being handed to an image-
+ * streaming function. Callers of guac_client_stream_png_hinted() (and any
+ * similar hinted encoders added later) pass one of these values to let the
+ * encoder pick compression parameters appropriate for the content. The hint
+ * is advisory - encoders may ignore it and fall back to general-purpose
+ * defaults, which is what happens automatically for
+ * GUAC_IMAGE_HINT_UNKNOWN.
+ *
+ * The intent is to capture what the caller can plausibly know about the
+ * content without the encoder having to re-scan the image:
+ *
+ *   - A display subsystem that has already computed a flat-color-run
+ *     optimality score can map it to SYNTHETIC or PHOTOGRAPHIC cheaply.
+ *   - A caller handing the encoder a fresh photograph from a webcam can
+ *     pass PHOTOGRAPHIC without any scan at all.
+ *   - A caller with no knowledge of the content passes UNKNOWN and lets
+ *     the encoder decide.
+ *
+ * Encoders MAY interpret PHOTOGRAPHIC as "skip the LZ77 matching pass
+ * because adjacent-pixel equality is rare" and SYNTHETIC as "keep the
+ * matching pass because runs of identical pixels are likely"; the
+ * benchmark under benchmark/png/ quantifies the speed/size tradeoffs
+ * that motivated this distinction.
+ */
+typedef enum guac_image_hint {
+
+    /**
+     * The caller has no information about the content of the image. The
+     * encoder should use conservative defaults that work acceptably across
+     * content types.
+     */
+    GUAC_IMAGE_HINT_UNKNOWN = 0,
+
+    /**
+     * The image is synthetically generated - flat-color regions, sharp
+     * edges, low color count. Typical of text, UI chrome, icons, diagrams,
+     * and terminal content. Encoders that have a choice of compression
+     * strategy should pick one that exploits adjacent-pixel repetition
+     * (e.g. zlib's default strategy with matching enabled).
+     */
+    GUAC_IMAGE_HINT_SYNTHETIC = 1,
+
+    /**
+     * The image is continuous-tone or photographic - smooth gradients,
+     * sensor/camera noise, and few same-colored-pixel runs. Encoders
+     * should skip compression paths that assume run-length regularity
+     * (e.g. prefer zlib's Huffman-only strategy, which trades a few
+     * percent of compression ratio for roughly 2x encode speed on
+     * photographic content).
+     */
+    GUAC_IMAGE_HINT_PHOTOGRAPHIC = 2
+
+} guac_image_hint;
+
 #endif
 

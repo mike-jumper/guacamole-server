@@ -1816,10 +1816,14 @@ static void __guac_common_surface_flush_to_webp(guac_common_surface* surface,
                     CAIRO_FORMAT_ARGB32, surface->dirty_rect.width,
                     surface->dirty_rect.height, surface->stride);
 
-        /* Send WebP for rect */
+        /* Send WebP for rect. The guac_common_surface layer predates the
+         * per-frame byte-budget machinery in guac_display and has no
+         * access to a target_bytes value, so pass 0 to keep the encoder
+         * in quality-only mode (matches prior behavior). */
         guac_client_stream_webp(surface->client, socket, GUAC_COMP_OVER, layer,
                 surface->dirty_rect.x, surface->dirty_rect.y, rect,
                 guac_common_surface_suggest_quality(surface->client),
+                0,
                 surface->lossless ? 1 : 0);
 
         cairo_surface_destroy(rect);

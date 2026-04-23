@@ -295,6 +295,13 @@ guac_client* guac_client_alloc(void) {
     guac_rwlock_init(&(client->__users_lock));
     guac_rwlock_init(&(client->__pending_users_lock));
 
+    /* Init sync-arrival event flag. Cleared at init; set by
+     * __guac_handle_sync on every sync ack; cleared by consumers
+     * (e.g. guac_display's render thread) before each timed-wait so
+     * the next wake corresponds to a sync that arrived during the
+     * wait rather than one already observed. */
+    guac_flag_init(&(client->sync_state));
+
     /* Set up broadcast sockets */
     client->socket = guac_socket_broadcast(client);
     client->pending_socket = guac_socket_broadcast_pending(client);
@@ -359,6 +366,11 @@ void guac_client_free(guac_client* client) {
     /* Destroy the reentrant read-write locks */
     guac_rwlock_destroy(&(client->__users_lock));
     guac_rwlock_destroy(&(client->__pending_users_lock));
+
+    /* Destroy sync-arrival event flag (no consumers remain by this
+     * point - guac_client_stop above has already unblocked any
+     * waiters via state transitions higher in the stack). */
+    guac_flag_destroy(&(client->sync_state));
 
     guac_mem_free(client->connection_id);
     guac_mem_free(client);
@@ -623,6 +635,75 @@ int guac_client_end_frame(guac_client* client) {
     return guac_client_end_multiple_frames(client, 0);
 }
 
+/**
+ * guac_client_foreach_user callback that appends an entry to the user's
+ * sync_emit_history ring for a freshly-emitted sync, capturing the
+ * number of bytes written to this user's socket for the frame that
+ * sync closes. Called by guac_client_end_multiple_frames() right
+ * after the sync is queued so downstream consumers (throughput EMA
+ * in __guac_handle_sync; the render thread's frame-pacing wait) can
+ * reason about what went out the door between syncs.
+ *
+ * Per-frame bytes are derived by subtracting the prior stored
+ * cumulative reading (last_sync_emit_cumulative_bytes) from a fresh
+ * guac_socket_bytes_written reading - that delta covers everything
+ * written between the previous sync's emit and this one, inclusive
+ * of this sync instruction itself.
+ *
+ * Append is O(1): store at (write_index & MASK), increment write_index,
+ * and on overflow advance read_index forward - no memmove anywhere.
+ * When the live range would exceed the ring's capacity, the oldest
+ * un-acked entry is displaced. Displacement costs at most the
+ * throughput sample and in-flight accounting for that one sync;
+ * tolerable, since displacement only happens when the client is
+ * already pathologically far behind.
+ */
+static void* __record_sync_emit(guac_user* user, void* data) {
+    guac_timestamp* timestamp = (guac_timestamp*) data;
+    size_t cumulative_bytes = guac_socket_bytes_written(user->socket);
+
+    pthread_mutex_lock(&user->sync_emit_lock);
+
+    /* Per-frame bytes = bytes written since the previous sync emit
+     * (or since connection start, for the first sync). The socket
+     * byte count is monotonic, so this is a plain subtraction. */
+    size_t frame_bytes =
+            cumulative_bytes - user->last_sync_emit_cumulative_bytes;
+    user->last_sync_emit_cumulative_bytes = cumulative_bytes;
+
+    /* If the new write will expand the live range past the ring's
+     * capacity, the oldest un-acked entry is about to be
+     * overwritten. Subtract its bytes from sum_ring_bytes BEFORE
+     * we advance read_index past it, then advance; post-condition:
+     * write_index - read_index == GUAC_USER_SYNC_EMIT_HISTORY_SIZE
+     * after the write below increments write_index. */
+    if (user->sync_emit_write_index - user->sync_emit_read_index
+            >= GUAC_USER_SYNC_EMIT_HISTORY_SIZE) {
+        uint64_t displaced_slot = user->sync_emit_read_index
+                & GUAC_USER_SYNC_EMIT_HISTORY_MASK;
+        user->sum_ring_bytes -=
+                user->sync_emit_history[displaced_slot].bytes;
+        user->sync_emit_read_index++;
+    }
+
+    /* Store the new entry at the next write slot. The slot may
+     * already hold a prior (out-of-live-range) entry; overwriting
+     * is fine - read_index has already passed it, and on overflow
+     * we advanced it above to skip the one we're about to clobber. */
+    uint64_t slot = user->sync_emit_write_index
+            & GUAC_USER_SYNC_EMIT_HISTORY_MASK;
+    user->sync_emit_history[slot].timestamp = *timestamp;
+    user->sync_emit_history[slot].bytes = frame_bytes;
+    user->sync_emit_history[slot].render_time_ms =
+            user->client->current_frame_render_time_ms;
+    user->sync_emit_write_index++;
+    user->sum_ring_bytes += frame_bytes;
+
+    pthread_mutex_unlock(&user->sync_emit_lock);
+
+    return NULL;
+}
+
 int guac_client_end_multiple_frames(guac_client* client, int frames) {
 
     /* Update and send timestamp */
@@ -632,7 +713,20 @@ int guac_client_end_multiple_frames(guac_client* client, int frames) {
     guac_client_log(client, GUAC_LOG_TRACE, "Server completed "
             "frame %" PRIu64 "ms (%i logical frames)", client->last_sent_timestamp, frames);
 
-    return guac_protocol_send_sync(client->socket, client->last_sent_timestamp, frames);
+    int result = guac_protocol_send_sync(client->socket,
+            client->last_sent_timestamp, frames);
+
+    /* Snapshot the cumulative byte count on each connected user's
+     * socket AFTER the sync has been queued. That value is the upper
+     * bound on bytes the user will have received by the time the ack
+     * for this sync arrives, which is exactly what the throughput
+     * computation in __guac_handle_sync needs (bytes sent after this
+     * sync but before the ack should NOT be counted against this
+     * frame's throughput - they belong to subsequent frames). */
+    guac_client_foreach_user(client, __record_sync_emit,
+            &client->last_sent_timestamp);
+
+    return result;
 
 }
 
@@ -765,6 +859,82 @@ int guac_client_get_processing_lag(guac_client* client) {
 
 }
 
+/**
+ * guac_client_foreach_user() callback that tracks the slowest effective
+ * throughput across all users. Each user's effective throughput is the
+ * lesser of its network-delivery estimate (bytes_per_ms) and its client-
+ * side processing estimate (processing_bytes_per_ms): whichever leg of
+ * the pipeline is the bottleneck caps the overall rate at which that
+ * user can actually consume bytes. Across users, the slowest user then
+ * caps the frame rate for the connection as a whole, so aggregate-to-
+ * minimum is the correct combiner at both levels.
+ *
+ * A zero estimate on either leg means "no sample yet" and is treated as
+ * unknown: it does NOT collapse the per-user min to zero, instead the
+ * other leg is used. Only when both legs are zero is the user skipped
+ * entirely (so users not yet contributing a sample don't masquerade as
+ * "stalled" before their first ack).
+ *
+ * @param user
+ *     The user to consider.
+ *
+ * @param data
+ *     A pointer to the current-best bytes_per_ms value to possibly
+ *     update.
+ *
+ * @return
+ *     Always NULL.
+ */
+static void* __combine_throughput(guac_user* user, void* data) {
+
+    int* slowest = (int*) data;
+
+    /* Per-user effective throughput: min(network, processing), with
+     * a 0 on either leg treated as unknown. */
+    int user_throughput;
+    if (user->bytes_per_ms > 0 && user->processing_bytes_per_ms > 0)
+        user_throughput =
+                user->bytes_per_ms < user->processing_bytes_per_ms
+                ? user->bytes_per_ms
+                : user->processing_bytes_per_ms;
+    else if (user->bytes_per_ms > 0)
+        user_throughput = user->bytes_per_ms;
+    else if (user->processing_bytes_per_ms > 0)
+        user_throughput = user->processing_bytes_per_ms;
+    else
+        return NULL;
+
+    /* Track the minimum effective throughput across users. */
+    if (*slowest == 0 || user_throughput < *slowest)
+        *slowest = user_throughput;
+
+    return NULL;
+
+}
+
+int guac_client_get_throughput(guac_client* client) {
+
+    int slowest = 0;
+
+    /* Find the slowest user with valid throughput data. */
+    guac_client_foreach_user(client, __combine_throughput, &slowest);
+
+    /* Nothing available - caller should fall back to processing_lag. */
+    if (slowest == 0)
+        return 0;
+
+    /* Enforce a floor so that one badly-degraded user doesn't drag the
+     * entire connection's pacing below a usable rate. 32 bytes/ms ≈
+     * 32 kB/s, which is conservative enough to keep the pipeline moving
+     * on an unusually slow link while still being fast enough to notice
+     * backpressure on a healthy client. */
+    if (slowest < GUAC_CLIENT_MIN_THROUGHPUT)
+        slowest = GUAC_CLIENT_MIN_THROUGHPUT;
+
+    return slowest;
+
+}
+
 void guac_client_stream_argv(guac_client* client, guac_socket* socket,
         const char* mimetype, const char* name, const char* value) {
 
@@ -788,6 +958,16 @@ void guac_client_stream_argv(guac_client* client, guac_socket* socket,
 void guac_client_stream_png(guac_client* client, guac_socket* socket,
         guac_composite_mode mode, const guac_layer* layer, int x, int y,
         cairo_surface_t* surface) {
+    /* Hintless variant: forward to the hinted entry point with an
+     * UNKNOWN hint so callers without content information still land
+     * on libpng's general-purpose defaults. */
+    guac_client_stream_png_hinted(client, socket, mode, layer, x, y,
+            surface, GUAC_IMAGE_HINT_UNKNOWN);
+}
+
+void guac_client_stream_png_hinted(guac_client* client, guac_socket* socket,
+        guac_composite_mode mode, const guac_layer* layer, int x, int y,
+        cairo_surface_t* surface, guac_image_hint hint) {
 
     /* Allocate new stream for image */
     guac_stream* stream = guac_client_alloc_stream(client);
@@ -795,8 +975,10 @@ void guac_client_stream_png(guac_client* client, guac_socket* socket,
     /* Declare stream as containing image data */
     guac_protocol_send_img(socket, stream, mode, layer, "image/png", x, y);
 
-    /* Write PNG data */
-    guac_png_write(socket, stream, surface);
+    /* Write PNG data, threading the content hint through so the
+     * encoder can pick compression parameters appropriate for the
+     * image type. */
+    guac_png_write(socket, stream, surface, hint);
 
     /* Terminate stream */
     guac_protocol_send_end(socket, stream);
@@ -829,7 +1011,21 @@ void guac_client_stream_jpeg(guac_client* client, guac_socket* socket,
 
 void guac_client_stream_webp(guac_client* client, guac_socket* socket,
         guac_composite_mode mode, const guac_layer* layer, int x, int y,
-        cairo_surface_t* surface, int quality, int lossless) {
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless) {
+    /* Hintless variant: forward to the hinted entry point with an
+     * UNKNOWN hint. WebP currently ignores the hint, but callers that
+     * supply one will be able to influence future adaptive tuning
+     * without a signature change here. */
+    guac_client_stream_webp_hinted(client, socket, mode, layer, x, y,
+            surface, quality, target_bytes, lossless,
+            GUAC_IMAGE_HINT_UNKNOWN);
+}
+
+void guac_client_stream_webp_hinted(guac_client* client, guac_socket* socket,
+        guac_composite_mode mode, const guac_layer* layer, int x, int y,
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless, guac_image_hint hint) {
 
 #ifdef ENABLE_WEBP
     /* Allocate new stream for image */
@@ -838,8 +1034,10 @@ void guac_client_stream_webp(guac_client* client, guac_socket* socket,
     /* Declare stream as containing image data */
     guac_protocol_send_img(socket, stream, mode, layer, "image/webp", x, y);
 
-    /* Write WebP data */
-    guac_webp_write(socket, stream, surface, quality, lossless);
+    /* Write WebP data, threading the hint for API symmetry with the
+     * PNG path even though the WebP encoder currently ignores it. */
+    guac_webp_write(socket, stream, surface, quality, target_bytes,
+            lossless, hint);
 
     /* Terminate stream */
     guac_protocol_send_end(socket, stream);
@@ -848,6 +1046,9 @@ void guac_client_stream_webp(guac_client* client, guac_socket* socket,
     guac_client_free_stream(client, stream);
 #else
     /* Do nothing if WebP support is not built in */
+    (void) client; (void) socket; (void) mode; (void) layer;
+    (void) x; (void) y; (void) surface; (void) quality;
+    (void) target_bytes; (void) lossless; (void) hint;
 #endif
 
 }

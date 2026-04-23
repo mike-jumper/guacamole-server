@@ -20,6 +20,7 @@
 #ifndef GUAC_ENCODE_PNG_H
 #define GUAC_ENCODE_PNG_H
 
+#include "guacamole/protocol-types.h"
 #include "guacamole/socket.h"
 #include "guacamole/stream.h"
 
@@ -38,11 +39,20 @@
  * @param surface
  *     The Cairo surface to write to the given stream and socket as PNG blobs.
  *
+ * @param hint
+ *     Advisory information about the nature of the image content (see
+ *     guac_image_hint in protocol-types.h). Controls the encoder's choice
+ *     of zlib compression strategy and PNG row filter for content types
+ *     where the tradeoff differs materially. Callers without content
+ *     knowledge should pass GUAC_IMAGE_HINT_UNKNOWN, which gets libpng's
+ *     general-purpose defaults (level=6, default strategy, adaptive
+ *     filter).
+ *
  * @return
  *     Zero if the encoding operation is successful, non-zero otherwise.
  */
 int guac_png_write(guac_socket* socket, guac_stream* stream,
-        cairo_surface_t* surface);
+        cairo_surface_t* surface, guac_image_hint hint);
 
 #endif
 

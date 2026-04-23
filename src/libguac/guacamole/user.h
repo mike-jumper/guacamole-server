@@ -41,6 +41,7 @@
 #include <cairo/cairo.h>
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdarg.h>
 
 struct guac_user_info {
@@ -112,6 +113,71 @@ struct guac_user_info {
 
 };
 
+/**
+ * Single entry in the outstanding-sync-emit history kept per user for
+ * throughput and frame-pacing accounting. Each time the server emits a
+ * sync toward a user, the user's sync_emit_history gains one of these,
+ * pairing the emitted sync's timestamp with the number of bytes that
+ * were written to the user's socket for the frame that sync closed
+ * (i.e. the bytes between this sync and the previous sync, inclusive
+ * of the sync instruction itself).
+ *
+ * Timestamps in an individual user's history are strictly ascending
+ * by construction (guac_client_end_multiple_frames always uses a
+ * monotonically-increasing guac_timestamp_current result), so lookups
+ * take advantage of ordering via early-exit on overshoot rather than
+ * needing bsearch. At the history's small size and the strong
+ * ordering invariant, a linear scan outperforms bsearch - see the
+ * sync_emit_history field below.
+ */
+typedef struct guac_user_sync_emit_record {
+
+    /**
+     * Timestamp of the emitted sync, as returned by
+     * guac_timestamp_current at the moment guac_client_end_multiple_frames
+     * called guac_protocol_send_sync.
+     */
+    guac_timestamp timestamp;
+
+    /**
+     * Number of bytes written to the user's socket for the frame this
+     * sync closes - equivalently, the cumulative-byte delta between
+     * the moment this sync was queued and the moment the immediately
+     * prior sync was queued (inclusive of both sync instructions'
+     * bytes, exclusive of anything queued after this sync).
+     *
+     * For the first sync ever emitted on a given user's socket, this
+     * captures everything written from connection start up through
+     * that sync - all handshake/setup bytes plus whatever the first
+     * frame produced.
+     */
+    size_t bytes;
+
+    /**
+     * Server-side wall-clock duration of the encode/emit pipeline
+     * that produced this sync - from display->frame_start (render
+     * thread entering the flush path) through the last encode
+     * worker emitting the sync, in milliseconds. Used directly as
+     * the denominator for the network-throughput EMA sample
+     * (frame_bytes / render_time_ms), replacing an earlier
+     * ack-interval-based denominator that was biased low by pre-
+     * pipeline idle time (outer wait, modification accumulation,
+     * pacing wait) and fed a self-reinforcing feedback loop with
+     * pacing decisions.
+     *
+     * render_time_ms captures active pipeline time only: TCP
+     * backpressure naturally extends it on a bandwidth-bound link,
+     * so the sample converges to real net_rate there; on a fast
+     * link it's encode-CPU-bound, which is the useful upper bound
+     * for pacing in that regime. Zero when no render-time
+     * information is available (the sync wasn't produced through
+     * the display pipeline); the ack handler skips the sample in
+     * that case.
+     */
+    int render_time_ms;
+
+} guac_user_sync_emit_record;
+
 struct guac_user {
 
     /**
@@ -182,6 +248,189 @@ struct guac_user {
      * frames, roughly excluding network lag.
      */
     int processing_lag;
+
+    /**
+     * Cumulative number of bytes written to this user's socket at
+     * the moment the server most recently emitted a sync to this
+     * user (as read via guac_socket_bytes_written right after the
+     * sync instruction was queued). Used by the next sync emit to
+     * compute how many bytes that next frame produced, by taking
+     * the fresh cumulative reading minus this value.
+     *
+     * Protected by sync_emit_lock (writes in __record_sync_emit).
+     */
+    size_t last_sync_emit_cumulative_bytes;
+
+    /**
+     * Running sum of per-frame byte counts across the live range
+     * [sync_emit_read_index, sync_emit_write_index) of
+     * sync_emit_history - i.e. the total bytes of all syncs still
+     * in flight (emitted to the socket but not yet acked by the
+     * client).
+     *
+     * Maintained incrementally: __record_sync_emit adds the new
+     * entry's bytes (and subtracts any displaced entry on
+     * overflow); __guac_handle_sync subtracts each walked entry's
+     * bytes as the ack consumes them.
+     *
+     * Read lock-free by the render thread's pre-encoding wait
+     * loop via guac_client_get_unacked_bytes (the loop polls for
+     * "is the client fully caught up yet?" - a stale read at
+     * worst delays or advances that check by one frame's worth).
+     * All writes happen under sync_emit_lock.
+     */
+    size_t sum_ring_bytes;
+
+    /**
+     * Server-clock time at which the sync ack most recently processed
+     * for this user was received. The interval between consecutive
+     * sync-ack receipts anchors the throughput sample's denominator:
+     * it approximates the interval over which the client actually
+     * received the corresponding bytes (bytes queued on the server's
+     * socket arrive at the client at network-delivery cadence, not
+     * at server-emit cadence - TCP buffers can absorb a burst of
+     * emits and release them at whatever wire rate the path actually
+     * sustains, so the server's emit timestamps can underestimate
+     * the transit window and overstate throughput). Using
+     * ack-receipt intervals instead makes the EMA track what the
+     * client sees arriving, which is the rate we want to pace
+     * against.
+     *
+     * Processing-lag jitter between consecutive syncs adds noise to
+     * the interval (ack_interval = client_receive_interval +
+     * (proc_N - proc_{N-1})) but averages to zero over the EMA, so
+     * a direct subtraction isn't needed for unbiased long-run
+     * estimates.
+     *
+     * Zero until the user has acknowledged at least one frame.
+     */
+    guac_timestamp last_acked_sync_receipt_time;
+
+    /**
+     * Ring buffer of outstanding sync emits: each entry captures the
+     * timestamp of a server-emitted sync alongside the number of
+     * bytes written to the user's socket for that sync's frame (see
+     * guac_user_sync_emit_record). On receipt of a sync ack,
+     * __guac_handle_sync scans forward from sync_emit_read_index for
+     * the matching timestamp, summing byte counts along the way to
+     * recover the total bytes between the previous ack and this one,
+     * then advances sync_emit_read_index past the match.
+     *
+     * The live range [read_index, write_index) is also read by the
+     * render thread's frame-pacing wait: summing per-frame byte
+     * counts across live entries yields the total bytes in flight
+     * that the client hasn't yet acked.
+     *
+     * The physical array index for the i-th monotonic index value
+     * is (i & GUAC_USER_SYNC_EMIT_HISTORY_MASK). Indices are 64-bit
+     * monotonic counters, never wrapping in any practical session
+     * lifetime; only their low bits are used for slot addressing,
+     * which makes emit and truncate O(1) with no memmove anywhere.
+     *
+     * Entries are appended in emit order (timestamps strictly
+     * ascending). A successful ack lookup just advances
+     * sync_emit_read_index; the matched and prior entries remain in
+     * the array but outside the live range [read_index, write_index)
+     * and will be overwritten in normal FIFO order as new syncs
+     * are emitted.
+     *
+     * Capacity limit: if write_index - read_index would exceed
+     * GUAC_USER_SYNC_EMIT_HISTORY_SIZE, the new emit displaces the
+     * oldest unacked entry by advancing read_index. That oldest
+     * entry corresponds to a sync that hasn't been acked yet, so
+     * the only practical effect of overflow is losing the throughput
+     * sample for that one sync - tolerable under steady-state
+     * pathologies (client far behind, server emitting rapidly) and
+     * irrelevant under normal operation where acks arrive well
+     * before the history fills.
+     *
+     * Protected by sync_emit_lock.
+     */
+    guac_user_sync_emit_record sync_emit_history[GUAC_USER_SYNC_EMIT_HISTORY_SIZE];
+
+    /**
+     * Monotonically-increasing index at which the NEXT sync emit
+     * will be stored. The physical array slot used for the next
+     * emit is (sync_emit_write_index &
+     * GUAC_USER_SYNC_EMIT_HISTORY_MASK); the index itself counts
+     * total emits ever (minus wrap after 2^64 emits, which is
+     * billions of years at any realistic frame rate).
+     *
+     * Protected by sync_emit_lock.
+     */
+    uint64_t sync_emit_write_index;
+
+    /**
+     * Monotonically-increasing index of the OLDEST unmatched sync
+     * in the history (or equal to sync_emit_write_index if the
+     * history is empty). Advances forward past the match on every
+     * successful ack lookup, and forward past a displaced entry on
+     * every overflow emit. Physical array slot for the live-range
+     * start is (sync_emit_read_index &
+     * GUAC_USER_SYNC_EMIT_HISTORY_MASK).
+     *
+     * Invariant (under sync_emit_lock):
+     *   sync_emit_read_index <= sync_emit_write_index
+     *   sync_emit_write_index - sync_emit_read_index <=
+     *       GUAC_USER_SYNC_EMIT_HISTORY_SIZE
+     *
+     * Protected by sync_emit_lock.
+     */
+    uint64_t sync_emit_read_index;
+
+    /**
+     * Mutex serializing writes to sync_emit_history (by whichever
+     * thread invokes guac_client_end_multiple_frames, typically the
+     * display render thread) and reads/drops from it (by this user's
+     * receive thread via __guac_handle_sync). Each critical section
+     * runs a memmove of at most GUAC_USER_SYNC_EMIT_HISTORY_SIZE
+     * record-sized entries plus a handful of integer stores, so
+     * contention is negligible at any realistic frame rate.
+     */
+    pthread_mutex_t sync_emit_lock;
+
+    /**
+     * Exponentially-smoothed estimate of this user's network-delivery
+     * throughput, in bytes per millisecond. Computed from (bytes
+     * flowing between consecutive acked syncs) / (ack-receipt
+     * interval), which approximates the rate at which the client is
+     * actually receiving bytes off the wire.
+     *
+     * Reflects the network limit only - it does not account for how
+     * fast the client can then decode/render the received bytes. For
+     * pacing, callers should combine this with processing_bytes_per_ms
+     * via a min() to respect whichever leg of the pipeline is the
+     * bottleneck.
+     *
+     * Updated on every sync ack. Zero until at least one sample has
+     * been collected; callers should treat zero as "unknown".
+     */
+    int bytes_per_ms;
+
+    /**
+     * Exponentially-smoothed estimate of this user's client-side
+     * processing throughput, in bytes per millisecond. Computed from
+     * (single frame's bytes) / (client-side processing time for that
+     * frame), which approximates how fast the client can decode and
+     * render the received payload once it has arrived.
+     *
+     * Reflects the CPU/GPU limit at the client only - it does not
+     * account for how fast bytes can actually reach the client. For
+     * pacing, combine with bytes_per_ms via a min().
+     *
+     * Samples are only generated for acks that correspond to the
+     * very next outstanding sync in the ring (i.e. no skipped acks
+     * between the last match and this one). When the client batches
+     * multiple syncs into a single ack, the byte delta spans
+     * multiple frames but the processing-lag denominator only
+     * reflects one, so those samples are skipped to keep the EMA
+     * clean.
+     *
+     * Updated on every successful consecutive-ack match. Zero until
+     * at least one sample has been collected; callers should treat
+     * zero as "unknown".
+     */
+    int processing_bytes_per_ms;
 
     /**
      * Information structure containing properties exposed by the remote
@@ -851,12 +1100,21 @@ void guac_user_stream_jpeg(guac_user* user, guac_socket* socket,
  *     quality of compression, with larger values producing smaller files at
  *     the expense of speed.
  *
+ * @param target_bytes
+ *     If greater than zero, the encoder targets this output size directly
+ *     (via libwebp's WebPConfig::target_size) and iterates the quantizer
+ *     to land close to it - the quality parameter acts as an upper bound
+ *     only. If zero, size targeting is disabled and the encoder produces
+ *     whatever size the given quality yields. Ignored entirely when
+ *     lossless is nonzero.
+ *
  * @param lossless
  *     Zero to encode a lossy image, non-zero to encode losslessly.
  */
 void guac_user_stream_webp(guac_user* user, guac_socket* socket,
         guac_composite_mode mode, const guac_layer* layer, int x, int y,
-        cairo_surface_t* surface, int quality, int lossless);
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless);
 
 /**
  * Returns whether the given user supports the "msg" instruction.

@@ -29,6 +29,7 @@
 #include "client-fntypes.h"
 #include "client-types.h"
 #include "client-constants.h"
+#include "flag.h"
 #include "layer-types.h"
 #include "object-types.h"
 #include "pool-types.h"
@@ -86,6 +87,45 @@ struct guac_client {
      * client.
      */
     guac_timestamp last_sent_timestamp;
+
+    /**
+     * Server-side wall-clock duration (in milliseconds) of the
+     * active encode/emit pipeline for the sync that's about to be
+     * emitted by guac_client_end_multiple_frames - measured from
+     * the moment the render thread entered the flush path
+     * (display->frame_start) through the moment the last encode
+     * worker reaches end-of-frame (just before emitting the sync).
+     * Captures real CPU / socket-write time but excludes all pre-
+     * pipeline idle (outer render-thread wait, modification
+     * accumulation, pre-encoding pacing wait).
+     *
+     * The caller sets this field immediately before the call; the
+     * per-user __record_sync_emit callback reads it and stamps it
+     * into the matching sync_emit_history entry. On ack receipt the
+     * throughput sample uses this as the denominator directly
+     * (frame_bytes / render_time_ms), giving a clean estimate of
+     * effective emit rate:
+     *
+     *   - On a bandwidth-bound link, TCP backpressure extends
+     *     render_time_ms to approximately frame_bytes / net_rate,
+     *     so the sample converges to actual network rate.
+     *
+     *   - On a fast link, render_time_ms is encode-CPU-bound and
+     *     the sample measures the server's encode rate, which is
+     *     the useful upper bound for pacing anyway.
+     *
+     * Zero indicates no render-time information available (callers
+     * that don't participate in the display render pipeline); the
+     * ack handler treats that as "no sample produced for this ack".
+     *
+     * Safe to write without synchronization: the one-flush-at-a-time
+     * gate in guac_display_end_multiple_frames means the last encode
+     * worker writes this field and immediately calls
+     * guac_client_end_multiple_frames, which reads it via the per-
+     * user foreach callback before returning. No other thread will
+     * write to it between those two points.
+     */
+    int current_frame_render_time_ms;
 
     /**
      * Handler for freeing data when the client is being unloaded.
@@ -311,7 +351,34 @@ struct guac_client {
      */
     void* __plugin_handle;
 
+    /**
+     * Single-bit event flag that transitions 1 whenever any connected
+     * user acknowledges a frame with a "sync" response. The flag is
+     * set from __guac_handle_sync after it has updated the client's
+     * processing-lag and throughput measurements, so a thread that
+     * observes the bit is guaranteed to see the freshest derived
+     * values on its next call to guac_client_get_processing_lag /
+     * guac_client_get_throughput.
+     *
+     * The intended consumer is any rate-limiting loop that wants to
+     * wait for client catch-up without oversleeping. Such a loop
+     * clears the flag, timed-waits on it with its computed wait as
+     * the timeout, re-measures on preemption, and then decides
+     * whether to continue waiting or proceed. See
+     * guac_display's render thread for the canonical usage.
+     */
+    guac_flag sync_state;
+
 };
+
+/**
+ * Bit value set on guac_client::sync_state each time any connected
+ * user acknowledges a frame with a sync response. The flag is a pure
+ * event signal - consumers are expected to clear it with
+ * guac_flag_clear before each wait, timed-wait for it, and treat a
+ * successful wake as "sync was received, re-measure".
+ */
+#define GUAC_CLIENT_SYNC_RECEIVED 1
 
 /**
  * Returns a new, barebones guac_client. This new guac_client has no handlers
@@ -653,6 +720,42 @@ int guac_client_load_plugin(guac_client* client, const char* protocol);
 int guac_client_get_processing_lag(guac_client* client);
 
 /**
+ * The minimum throughput estimate (in bytes/ms) that
+ * guac_client_get_throughput() will return. Caps how far pacing will
+ * slow down even on a badly degraded client - below this rate we accept
+ * falling further behind rather than grind the frame pipeline to a
+ * practical halt.
+ *
+ * 32 bytes/ms is roughly 32 kB/s, a sustainable rate on even extremely
+ * slow links, while still being fast enough that pacing-induced delays
+ * stay visible as backpressure rather than freezes.
+ */
+#define GUAC_CLIENT_MIN_THROUGHPUT 32
+
+/**
+ * Returns an estimate of the overall throughput (in bytes per millisecond)
+ * being sustained by the slowest user connected to this client. The
+ * estimate is an exponentially-smoothed average of per-frame samples
+ * (frame_bytes / frame_round_trip_time) and reflects both network
+ * bandwidth and client-side decode/render cost.
+ *
+ * The returned value is clamped below by GUAC_CLIENT_MIN_THROUGHPUT so
+ * one badly-degraded user cannot drag the whole connection's pacing
+ * decisions to zero. A return value of zero means no user has produced
+ * a throughput sample yet (typically during the first frame or two of a
+ * connection); callers should fall back to processing_lag in that case.
+ *
+ * @param client
+ *     The guac_client to query.
+ *
+ * @return
+ *     The approximate bytes-per-millisecond throughput of the slowest
+ *     user (clamped to at least GUAC_CLIENT_MIN_THROUGHPUT), or zero if
+ *     no throughput samples are available yet.
+ */
+int guac_client_get_throughput(guac_client* client);
+
+/**
  * Sends a request to the owner of the given guac_client for parameters required
  * to continue the connection started by the client. The function returns zero
  * on success or non-zero on failure.
@@ -730,6 +833,47 @@ void guac_client_stream_png(guac_client* client, guac_socket* socket,
 
 /**
  * Streams the image data of the given surface over an image stream ("img"
+ * instruction) as PNG-encoded data, using the given content hint to inform
+ * the encoder's choice of compression parameters. The image stream will be
+ * automatically allocated and freed. For callers without content-nature
+ * knowledge, guac_client_stream_png() is equivalent to this function with
+ * hint set to GUAC_IMAGE_HINT_UNKNOWN.
+ *
+ * @param client
+ *     The Guacamole client for which the image stream should be allocated.
+ *
+ * @param socket
+ *     The socket over which instructions associated with the image stream
+ *     should be sent.
+ *
+ * @param mode
+ *     The composite mode to use when rendering the image over the given layer.
+ *
+ * @param layer
+ *     The destination layer.
+ *
+ * @param x
+ *     The X coordinate of the upper-left corner of the destination rectangle
+ *     within the given layer.
+ *
+ * @param y
+ *     The Y coordinate of the upper-left corner of the destination rectangle
+ *     within the given layer.
+ *
+ * @param surface
+ *     A Cairo surface containing the image data to be streamed.
+ *
+ * @param hint
+ *     Advisory information about the nature of the image content. See
+ *     guac_image_hint for the semantics of each value. When no hint is
+ *     available, pass GUAC_IMAGE_HINT_UNKNOWN.
+ */
+void guac_client_stream_png_hinted(guac_client* client, guac_socket* socket,
+        guac_composite_mode mode, const guac_layer* layer, int x, int y,
+        cairo_surface_t* surface, guac_image_hint hint);
+
+/**
+ * Streams the image data of the given surface over an image stream ("img"
  * instruction) as JPEG-encoded data at the given quality. The image stream
  * will be automatically allocated and freed.
  *
@@ -804,12 +948,79 @@ void guac_client_stream_jpeg(guac_client* client, guac_socket* socket,
  *     quality of compression, with larger values producing smaller files at
  *     the expense of speed.
  *
+ * @param target_bytes
+ *     If greater than zero, the encoder targets this output size directly
+ *     (via libwebp's WebPConfig::target_size) and iterates the quantizer
+ *     to land close to it - the quality parameter acts as an upper bound
+ *     only. If zero, size targeting is disabled and the encoder produces
+ *     whatever size the given quality yields. Ignored entirely when
+ *     lossless is nonzero.
+ *
  * @param lossless
  *     Zero to encode a lossy image, non-zero to encode losslessly.
  */
 void guac_client_stream_webp(guac_client* client, guac_socket* socket,
         guac_composite_mode mode, const guac_layer* layer, int x, int y,
-        cairo_surface_t* surface, int quality, int lossless);
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless);
+
+/**
+ * Streams the image data of the given surface over an image stream ("img"
+ * instruction) as WebP-encoded data at the given quality, threading a
+ * content hint through to the encoder for API symmetry with
+ * guac_client_stream_png_hinted. The WebP encoder currently does not
+ * act on the hint - per-content benchmarks showed no hint-driven
+ * parameter change is worthwhile at the WebP layer today - but the
+ * hint is plumbed through so callers with content information can pass
+ * it consistently regardless of which codec ends up being chosen, and
+ * so future adaptive WebP tuning can land without another public
+ * signature change.
+ *
+ * For callers without content-nature information, guac_client_stream_webp
+ * is equivalent to this function with hint set to GUAC_IMAGE_HINT_UNKNOWN.
+ *
+ * @param client
+ *     The Guacamole client for whom the image stream should be allocated.
+ *
+ * @param socket
+ *     The socket over which instructions associated with the image stream
+ *     should be sent.
+ *
+ * @param mode
+ *     The composite mode to use when rendering the image over the given layer.
+ *
+ * @param layer
+ *     The destination layer.
+ *
+ * @param x
+ *     The X coordinate of the upper-left corner of the destination rectangle
+ *     within the given layer.
+ *
+ * @param y
+ *     The Y coordinate of the upper-left corner of the destination rectangle
+ *     within the given layer.
+ *
+ * @param surface
+ *     A Cairo surface containing the image data to be streamed.
+ *
+ * @param quality
+ *     The WebP image quality (0-100).
+ *
+ * @param target_bytes
+ *     Optional output-size target, or zero to disable size targeting. See
+ *     guac_client_stream_webp() for the full semantics.
+ *
+ * @param lossless
+ *     Zero for lossy, non-zero for lossless.
+ *
+ * @param hint
+ *     Advisory information about the nature of the image content. See
+ *     guac_image_hint for the semantics of each value.
+ */
+void guac_client_stream_webp_hinted(guac_client* client, guac_socket* socket,
+        guac_composite_mode mode, const guac_layer* layer, int x, int y,
+        cairo_surface_t* surface, int quality, int target_bytes,
+        int lossless, guac_image_hint hint);
 
 /**
  * Returns whether the owner of the given client supports the "msg"
