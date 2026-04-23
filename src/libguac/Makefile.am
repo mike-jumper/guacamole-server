@@ -122,6 +122,7 @@ noinst_HEADERS =              \
     encode-png.h              \
     id.h                      \
     file-private.h            \
+    image-util.h              \
     palette.h                 \
     raw_encoder.h             \
     user-handlers.h           \
@@ -146,6 +147,7 @@ libguac_la_SOURCES =          \
     display-worker.c          \
     encode-jpeg.c             \
     encode-png.c              \
+    image-util.c              \
     error.c                   \
     fifo.c                    \
     file.c                    \

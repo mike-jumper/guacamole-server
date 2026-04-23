@@ -41,11 +41,28 @@ guac_palette* guac_palette_alloc(cairo_surface_t* surface) {
     /* Allocate palette */
     guac_palette* palette = (guac_palette*) guac_mem_zalloc(sizeof(guac_palette));
 
+    /* Adjacent-pixel fast path. Text, UI, and synthetic screenshots (the
+     * workloads that hit the palette-PNG path when lossless-only mode is
+     * configured) contain long horizontal runs of the same color, so
+     * caching the previously-seen color and short-circuiting duplicates
+     * skips the hash probe for the majority of pixels in practice.
+     * Seeded with an impossible sentinel (negative) that can't occur
+     * from `color & 0xFFFFFF`, so the first pixel always takes the slow
+     * path. */
+    int prev_color = -1;
+
     for (y=0; y<height; y++) {
         for (x=0; x<width; x++) {
 
             /* Get pixel color */
             int color = ((uint32_t*) data)[x] & 0xFFFFFF;
+
+            /* Fast path: identical to previous pixel - already inserted
+             * by the previous iteration, so we can skip the entire hash
+             * probe. */
+            if (color == prev_color)
+                continue;
+            prev_color = color;
 
             /* Calculate hash code */
             int hash = ((color & 0xFFF000) >> 12) ^ (color & 0xFFF);
@@ -54,7 +71,7 @@ guac_palette* guac_palette_alloc(cairo_surface_t* surface) {
 
             /* Search for open palette entry */
             for (;;) {
-                
+
                 entry = &(palette->entries[hash]);
 
                 /* If we've found a free space, use it */

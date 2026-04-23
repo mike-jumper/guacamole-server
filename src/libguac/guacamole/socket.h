@@ -93,18 +93,48 @@ struct guac_socket {
     guac_timestamp last_write_timestamp;
 
     /**
-     * The number of bytes present in the base64 "ready" buffer.
+     * The cumulative number of bytes written to this socket since it was
+     * allocated. Increments monotonically on every successful write and is
+     * never reset. Callers measure bytes-per-frame by sampling this value
+     * at the start and end of a frame and taking the difference.
+     *
+     * This counter is updated under whatever serialization already guards
+     * writes to the socket (typically the instruction lock acquired via
+     * guac_socket_instruction_begin()), and is read atomically via
+     * guac_socket_bytes_written() for cross-thread visibility.
+     */
+    size_t total_bytes_written;
+
+    /**
+     * The number of bytes currently held in the base64 "ready" buffer as a
+     * partial 3-byte group left over from a previous call to
+     * guac_socket_write_base64(). Always 0, 1, or 2 between calls; the
+     * bulk encode path operates directly on the caller's buffer so the
+     * "ready" buffer only ever stores the straggling tail.
      */
     int __ready;
 
     /**
-     * The base64 "ready" buffer. Once this buffer is filled, the data is encoded
-     * as base64 and flushed to the main write buffer.
+     * The base64 "ready" buffer. Holds at most 2 bytes between calls - the
+     * tail of a partial 3-byte group that is completed once more input
+     * arrives. Sized generously for historical reasons; the bulk encode
+     * path bypasses this buffer entirely by encoding 12 input bytes
+     * straight from the caller's buffer into __encoded_buf per SIMD
+     * iteration.
      */
     unsigned char __ready_buf[GUAC_SOCKET_BASE64_READY_BUFFER_SIZE];
 
     /**
-     * The buffer to hold the result of encoding the ready buffer as base64.
+     * The number of base64 characters currently accumulated in
+     * __encoded_buf. The buffer is flushed to the socket when a subsequent
+     * encode step would overflow it and on every guac_socket_flush_base64()
+     * call, batching many small writes into a single output syscall.
+     */
+    int __encoded;
+
+    /**
+     * The buffer in which encoded base64 characters accumulate before being
+     * written out to the socket.
      */
     char __encoded_buf[GUAC_SOCKET_BASE64_ENCODED_BUFFER_SIZE];
 
@@ -145,6 +175,23 @@ void guac_socket_free(guac_socket* socket);
  *     The guac_socket to declare as requiring an automatic keep-alive ping.
  */
 void guac_socket_require_keep_alive(guac_socket* socket);
+
+/**
+ * Returns the cumulative number of bytes successfully written to the given
+ * socket since it was allocated. The returned value increments
+ * monotonically and is never reset; callers should sample this at frame
+ * boundaries and take differences to measure per-frame byte counts.
+ *
+ * This read is atomic with respect to concurrent writes and is safe to
+ * invoke from any thread.
+ *
+ * @param socket
+ *     The guac_socket to query.
+ *
+ * @return
+ *     The total number of bytes written to the socket since allocation.
+ */
+size_t guac_socket_bytes_written(guac_socket* socket);
 
 /**
  * Marks the beginning of a Guacamole protocol instruction.
