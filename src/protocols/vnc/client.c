@@ -35,6 +35,7 @@
 
 #include <guacamole/client.h>
 #include <guacamole/display.h>
+#include <guacamole/fifo.h>
 #include <guacamole/mem.h>
 #include <guacamole/recording.h>
 
@@ -115,6 +116,28 @@ int guac_client_init(guac_client* client) {
     /* Initialize the message lock. */
     pthread_mutex_init(&(vnc_client->message_lock), NULL);
 
+    /* Initialize the input event queue that decouples Guacamole-client-
+     * side input processing from the VNC server's write path. Events
+     * are produced by user input threads (via guac_vnc_input_event_
+     * enqueue) and consumed by the drain thread started below. */
+    guac_fifo_init(&vnc_client->input_events, vnc_client->input_events_items,
+            GUAC_VNC_INPUT_EVENT_QUEUE_SIZE, sizeof(guac_vnc_input_event));
+
+    /* Start the input drain thread. It blocks on the fifo's own
+     * signalling (guac_fifo_dequeue_and_lock) and forwards each
+     * dequeued event to the VNC server under message_lock. It exits
+     * cleanly when the fifo is invalidated at shutdown. */
+    if (pthread_create(&vnc_client->input_drain_thread, NULL,
+            guac_vnc_input_drain_thread, vnc_client) == 0) {
+        vnc_client->input_drain_thread_running = 1;
+    }
+    else {
+        guac_client_log(client, GUAC_LOG_WARNING,
+                "Failed to start VNC input drain thread; input events "
+                "will accumulate unforwarded on the queue.");
+        vnc_client->input_drain_thread_running = 0;
+    }
+
     /* Set handlers */
     client->join_handler = guac_vnc_user_join_handler;
     client->join_pending_handler = guac_vnc_join_pending_handler;
@@ -133,6 +156,17 @@ int guac_vnc_client_free_handler(guac_client* client) {
      * underlying memory */
     if (vnc_client->display != NULL)
         guac_display_stop(vnc_client->display);
+
+    /* Stop the input drain thread before tearing down rfb_client, so it
+     * does not make any further SendPointerEvent / SendKeyEvent calls
+     * against a freed client. Invalidating the fifo is how we wake the
+     * drain thread from its guac_fifo_dequeue_and_lock(); the thread
+     * observes a zero return and exits. */
+    if (vnc_client->input_drain_thread_running) {
+        guac_fifo_invalidate(&vnc_client->input_events);
+        pthread_join(vnc_client->input_drain_thread, NULL);
+        vnc_client->input_drain_thread_running = 0;
+    }
 
     /* Clean up VNC client*/
     rfbClient* rfb_client = vnc_client->rfb_client;
@@ -217,6 +251,13 @@ int guac_vnc_client_free_handler(guac_client* client) {
 
     /* Clean up the message lock. */
     pthread_mutex_destroy(&(vnc_client->message_lock));
+
+    /* Tear down the input event queue. The drain thread has already
+     * been joined above; user input threads have likewise stopped
+     * enqueuing by this point (the client left RUNNING state, user
+     * threads exit, and the handshake tears them down before this
+     * handler runs). */
+    guac_fifo_destroy(&vnc_client->input_events);
 
     /* Free generic data struct */
     guac_mem_free(client->data);

@@ -23,10 +23,12 @@
 #include "common/clipboard.h"
 #include "common/iconv.h"
 #include "display.h"
+#include "input.h"
 #include "settings.h"
 
 #include <guacamole/client.h>
 #include <guacamole/display.h>
+#include <guacamole/fifo.h>
 #include <guacamole/layer.h>
 #include <rfb/rfbclient.h>
 
@@ -51,6 +53,17 @@
 #define GUAC_VNC_SCREEN_ID 1
 
 /**
+ * Capacity of the per-VNC-client input event queue (see guac_vnc_client's
+ * input_events field). Sized generously so that multiple simultaneous users
+ * each generating high-rate mouse events over several tens of milliseconds
+ * cannot overflow the queue and block their input threads. At ~60 events
+ * per user per second, 1024 slots accommodates several users' worth of
+ * input over a full second - far more than the VNC main thread should
+ * ever need to drain at once.
+ */
+#define GUAC_VNC_INPUT_EVENT_QUEUE_SIZE 1024
+
+/**
  * VNC-specific client data.
  */
 typedef struct guac_vnc_client {
@@ -68,9 +81,60 @@ typedef struct guac_vnc_client {
 #endif
 
     /**
-     * Lock which synchronizes messages sent to VNC server.
+     * Lock which synchronizes messages sent to VNC server. Held by any
+     * path that writes to the VNC server socket - the writer thread
+     * draining input_events (see below), and the infrequent resize /
+     * server-input-toggle paths on the main thread. Libvncclient's
+     * HandleRFBServerMessage itself writes nothing to the socket in
+     * this build because the rfbFramebufferUpdateRequest support bit
+     * is cleared at connection setup (see guac_vnc_get_client), so the
+     * main thread's decode can run concurrently with input dispatch on
+     * the writer thread without either blocking the other.
      */
     pthread_mutex_t message_lock;
+
+    /**
+     * FIFO of pending outbound messages consumed by a dedicated writer
+     * thread (see input_drain_thread below). Despite the historical
+     * "input" naming, this FIFO carries every server-bound message
+     * whose ordering matters for input responsiveness: user-driven
+     * mouse/key events produced by user input threads and FUR markers
+     * produced by the reader thread's FinishedFrameBufferUpdate
+     * callback and by the MallocFrameBuffer callback on server-
+     * initiated resize. Routing both classes of message through the
+     * same FIFO gives strict enqueue-order delivery - any mouse/key
+     * event that was queued before a FUR will land on the server
+     * ahead of that FUR, so the server's framebuffer response
+     * reflects the input rather than pre-input state. Decoding on the
+     * reader thread does not hold any lock, so a slow VNC server or
+     * slow decode cannot stall user-input dispatch.
+     */
+    guac_fifo input_events;
+
+    /**
+     * Backing storage for the input_events FIFO.
+     */
+    guac_vnc_input_event input_events_items[GUAC_VNC_INPUT_EVENT_QUEUE_SIZE];
+
+    /**
+     * Writer thread that blocks on the input_events FIFO's internal
+     * signalling (via guac_fifo_dequeue_and_lock) and dispatches each
+     * dequeued outbound message to the VNC server under message_lock -
+     * pointer/key events via libvncclient's SendPointerEvent /
+     * SendKeyEvent, FUR markers via the internal guac_vnc_send_fur
+     * helper (which bypasses the disabled supportedMessages check).
+     * Started during client init; exits when the FIFO is invalidated
+     * during client cleanup.
+     */
+    pthread_t input_drain_thread;
+
+    /**
+     * Whether input_drain_thread has been successfully started. The
+     * cleanup path joins the thread only if this is set, so that a
+     * failure to start the thread during init does not cause a hang at
+     * shutdown waiting for a nonexistent thread.
+     */
+    int input_drain_thread_running;
 
     /**
      * The underlying VNC client.

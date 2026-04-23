@@ -36,6 +36,7 @@ libguac_client_vnc_la_SOURCES = \
     cursor.c                    \
     display.c                   \
     input.c                     \
+    input-queue.c               \
     log.c                       \
     settings.c                  \
     user.c                      \

@@ -237,8 +237,22 @@ static rfbBool guac_vnc_send_desktop_size(rfbClient* client, int width, int heig
     client->requestedResize = FALSE;
 #endif // LIBVNC_HAS_REQUESTED_RESIZE
 
-    if (!SendFramebufferUpdateRequest(client, 0, 0, width, height, FALSE)) {
-        guac_client_log(gc, GUAC_LOG_WARNING, "Failed to request a full screen update.");
+    /* Enqueue a full-rect FUR on the writer thread's FIFO rather than
+     * calling SendFramebufferUpdateRequest here directly. The built-in
+     * send would no-op anyway (we cleared the rfbFramebufferUpdateRequest
+     * support bit at connection setup to suppress libvncclient's
+     * auto-FUR), and routing this through the FIFO preserves the
+     * ordering invariant: any user-input events the writer hasn't
+     * dispatched yet are ahead of this marker in line, so the server
+     * receives them before the FUR and the full-frame response it
+     * generates reflects those events. */
+    {
+        guac_vnc_client* vnc_client = (guac_vnc_client*) gc->data;
+        guac_vnc_input_event fur_event = {
+            .type = GUAC_VNC_INPUT_EVENT_FUR_FULL,
+            .details.fur = { .x = 0, .y = 0, .w = width, .h = height }
+        };
+        guac_vnc_input_event_enqueue(vnc_client, &fur_event);
     }
 
 #ifdef LIBVNC_CLIENT_HAS_REQUESTED_RESIZE
@@ -346,6 +360,25 @@ void guac_vnc_set_pixel_format(rfbClient* client, int color_depth) {
     }
 }
 
+void guac_vnc_finished_fb_update(rfbClient* client) {
+
+    guac_client* gc = rfbClientGetClientData(client, GUAC_VNC_CLIENT_KEY);
+    guac_vnc_client* vnc_client = (guac_vnc_client*) gc->data;
+
+    /* Enqueue an incremental FUR on the writer FIFO. Any user-input
+     * events that arrived during the decode that just finished are
+     * already ahead of this marker in the FIFO (they were enqueued
+     * before this callback fired), so the writer thread will dispatch
+     * them onto the server's socket before the FUR. The framebuffer
+     * update the server generates in response therefore reflects
+     * those events - no extra round-trip needed. */
+    guac_vnc_input_event fur_event = {
+        .type = GUAC_VNC_INPUT_EVENT_FUR_INCREMENTAL
+    };
+    guac_vnc_input_event_enqueue(vnc_client, &fur_event);
+
+}
+
 rfbBool guac_vnc_malloc_framebuffer(rfbClient* rfb_client) {
 
     guac_client* gc = rfbClientGetClientData(rfb_client, GUAC_VNC_CLIENT_KEY);
@@ -353,6 +386,35 @@ rfbBool guac_vnc_malloc_framebuffer(rfbClient* rfb_client) {
 
     /* Use original, wrapped proc to resize the buffer maintained by
      * libvncclient */
-    return vnc_client->rfb_MallocFrameBuffer(rfb_client);
+    rfbBool result = vnc_client->rfb_MallocFrameBuffer(rfb_client);
+
+    /* If this allocation was triggered by a server-initiated resize
+     * (rfbReSizeFrameBuffer, rfbPalmVNCReSizeFrameBuffer, or the
+     * extended-desktop-size encoding inside a framebuffer update),
+     * libvncclient would normally follow it with a full-rect FUR via
+     * its built-in SendFramebufferUpdateRequest. That built-in send is
+     * suppressed in our build (see guac_vnc_get_client's clearing of
+     * the rfbFramebufferUpdateRequest bit), so the full-rect FUR must
+     * be driven by us instead. Enqueuing it on the writer FIFO keeps
+     * the ordering property against user-input events.
+     *
+     * vnc_client->rfb_client is NULL during the initial allocation
+     * that runs inside rfbInitClient; that initial allocation is
+     * already followed by a non-incremental FUR inside rfbInitClient
+     * itself (before the support bit is cleared), so enqueuing here
+     * would be a redundant duplicate. */
+    if (result && vnc_client->rfb_client != NULL) {
+        guac_vnc_input_event fur_event = {
+            .type = GUAC_VNC_INPUT_EVENT_FUR_FULL,
+            .details.fur = {
+                .x = 0, .y = 0,
+                .w = rfb_client->width,
+                .h = rfb_client->height
+            }
+        };
+        guac_vnc_input_event_enqueue(vnc_client, &fur_event);
+    }
+
+    return result;
 
 }

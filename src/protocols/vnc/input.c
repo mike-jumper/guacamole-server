@@ -20,8 +20,10 @@
 #include "config.h"
 
 #include "display.h"
+#include "input.h"
 #include "vnc.h"
 
+#include <guacamole/client.h>
 #include <guacamole/display.h>
 #include <guacamole/recording.h>
 #include <guacamole/user.h>
@@ -31,18 +33,31 @@ int guac_vnc_user_mouse_handler(guac_user* user, int x, int y, int mask) {
 
     guac_client* client = user->client;
     guac_vnc_client* vnc_client = (guac_vnc_client*) client->data;
-    rfbClient* rfb_client = vnc_client->rfb_client;
 
-    /* Store current mouse location/state */
+    /* Store current mouse location/state. Non-blocking - only flips a flag
+     * in the render thread's state so the next emitted frame includes the
+     * latest cursor position. */
     guac_display_render_thread_notify_user_moved_mouse(vnc_client->render_thread, user, x, y, mask);
 
-    /* Report mouse position within recording */
+    /* Report mouse position within recording, if active. Writes to the
+     * recording file's buffered socket; does not block on the VNC server. */
     if (vnc_client->recording != NULL)
         guac_recording_report_mouse(vnc_client->recording, x, y, mask);
 
-    /* Send VNC event only if finished connecting */
-    if (rfb_client != NULL)
-        SendPointerEvent(rfb_client, x, y, mask);
+    /* Queue the event for the drain thread to forward to the VNC
+     * server. The user input thread does not wait for the VNC server
+     * to acknowledge receipt, so a slow VNC server or slow upstream
+     * network cannot stall Guacamole-side input processing. */
+    guac_vnc_input_event mouse_event = {
+        .type = GUAC_VNC_INPUT_EVENT_MOUSE,
+        .user = user,
+        .details.mouse = {
+            .x = x,
+            .y = y,
+            .mask = mask
+        }
+    };
+    guac_vnc_input_event_enqueue(vnc_client, &mouse_event);
 
     return 0;
 }
@@ -50,16 +65,22 @@ int guac_vnc_user_mouse_handler(guac_user* user, int x, int y, int mask) {
 int guac_vnc_user_key_handler(guac_user* user, int keysym, int pressed) {
 
     guac_vnc_client* vnc_client = (guac_vnc_client*) user->client->data;
-    rfbClient* rfb_client = vnc_client->rfb_client;
 
-    /* Report key state within recording */
+    /* Report key state within recording, if active. */
     if (vnc_client->recording != NULL)
-        guac_recording_report_key(vnc_client->recording,
-                keysym, pressed);
+        guac_recording_report_key(vnc_client->recording, keysym, pressed);
 
-    /* Send VNC event only if finished connecting */
-    if (rfb_client != NULL)
-        SendKeyEvent(rfb_client, keysym, pressed);
+    /* Queue the event for the drain thread to forward to the VNC
+     * server. See guac_vnc_user_mouse_handler for rationale. */
+    guac_vnc_input_event key_event = {
+        .type = GUAC_VNC_INPUT_EVENT_KEY,
+        .user = user,
+        .details.key = {
+            .keysym = keysym,
+            .pressed = pressed
+        }
+    };
+    guac_vnc_input_event_enqueue(vnc_client, &key_event);
 
     return 0;
 }

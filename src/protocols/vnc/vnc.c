@@ -142,6 +142,17 @@ rfbClient* guac_vnc_get_client(guac_client* client) {
     vnc_client->rfb_GotCopyRect = rfb_client->GotCopyRect;
     rfb_client->GotCopyRect = guac_vnc_copyrect;
 
+    /* Installed in place of libvncclient's built-in tail of
+     * HandleRFBServerMessage's rfbFramebufferUpdate handler: libvncclient
+     * ordinarily sends an incremental FUR there itself, then fires this
+     * callback. We suppress that auto-send (see end of this function)
+     * and instead enqueue the FUR on our writer-thread FIFO from the
+     * callback, so any user-input events already queued by the time
+     * this frame finished decoding land on the server ahead of the
+     * FUR - the ordering invariant that keeps input latency
+     * independent of decode time. */
+    rfb_client->FinishedFrameBufferUpdate = guac_vnc_finished_fb_update;
+
 #ifdef ENABLE_VNC_TLS_LOCKING
     /* TLS Locking and Unlocking */
     rfb_client->LockWriteToTLS = guac_vnc_lock_write_to_tls;
@@ -235,8 +246,28 @@ rfbClient* guac_vnc_get_client(guac_client* client) {
         rfb_client->appData.encodingsString = strdup(vnc_settings->encodings);
 
     /* Connect */
-    if (rfbInitClient(rfb_client, NULL, NULL))
+    if (rfbInitClient(rfb_client, NULL, NULL)) {
+
+        /* Suppress libvncclient's built-in auto-FramebufferUpdateRequest
+         * at the tail of HandleRFBServerMessage. Libvncclient gates
+         * every FUR path on SupportsClient2Server(rfbFramebufferUpdateRequest),
+         * so clearing the bit after the initial FUR sent by
+         * rfbInitClient leaves the initial request intact while making
+         * all subsequent internal SendFramebufferUpdateRequest calls
+         * no-ops. Our writer thread emits FURs on its own via
+         * guac_vnc_send_fur (see input-queue.c), enqueued after each
+         * successful HandleRFBServerMessage so that any user-input
+         * events queued ahead of the FUR reach the server first. This
+         * is the core invariant that keeps input latency independent
+         * of decode time - without suppression, libvncclient would
+         * race a FUR onto the wire ahead of any events that arrived
+         * during the preceding decode. */
+        rfb_client->supportedMessages.client2server[
+                rfbFramebufferUpdateRequest / 8]
+                &= ~(1 << (rfbFramebufferUpdateRequest % 8));
+
         return rfb_client;
+    }
 
     /* If connection fails, return NULL */
     return NULL;
@@ -341,6 +372,15 @@ static rfbBool guac_vnc_handle_messages(guac_client* client) {
      * automatically deals with invalid dimensions and is a no-op
      * if the size has not changed) */
     guac_display_layer_resize(default_layer, rfb_client->width, rfb_client->height);
+
+    /* The next incremental FUR is driven by the FinishedFrameBufferUpdate
+     * callback installed in guac_vnc_get_client (guac_vnc_finished_fb_update
+     * below), which fires only for actual rfbFramebufferUpdate messages
+     * and enqueues the FUR on the writer thread's FIFO. Queueing the
+     * FUR there (rather than here, at every handle_messages return)
+     * avoids over-requesting: messages like rfbBell and rfbServerCutText
+     * should not trigger a fresh framebuffer request, and the callback
+     * skips those automatically. */
 
     return retval;
 
@@ -624,7 +664,11 @@ void* guac_vnc_client_thread(void* data) {
 
     vnc_client->render_thread = guac_display_render_thread_create(vnc_client->display);
 
-    /* Handle messages from VNC server while client is running */
+    /* Handle messages from VNC server while client is running. User input
+     * is not processed here; it's drained by a dedicated thread that
+     * blocks on the input_events fifo's own signalling and forwards
+     * events under message_lock (see input-queue.c). That means a slow
+     * VNC server cannot stall Guacamole-client-side input processing. */
     while (client->state == GUAC_CLIENT_RUNNING) {
 
         /* Wait for data and construct a reasonable frame */

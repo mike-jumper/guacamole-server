@@ -50,6 +50,24 @@
 void guac_vnc_update(rfbClient* client, int x, int y, int w, int h);
 
 /**
+ * Callback installed as rfb_client->FinishedFrameBufferUpdate, invoked
+ * by libvncclient at the end of each rfbFramebufferUpdate message
+ * (after GotFrameBufferUpdate has been invoked for each constituent
+ * rectangle). Enqueues an incremental FramebufferUpdateRequest marker
+ * on the writer thread's FIFO so the next frame is requested only
+ * after any user-input events already in the FIFO have been
+ * dispatched to the server. Replaces libvncclient's built-in inline
+ * auto-FUR at the tail of HandleRFBServerMessage, which is suppressed
+ * for us (see guac_vnc_get_client) so this callback can take over the
+ * FUR cadence with ordering guarantees.
+ *
+ * @param client
+ *     The libvncclient client whose framebuffer update message just
+ *     finished processing.
+ */
+void guac_vnc_finished_fb_update(rfbClient* client);
+
+/**
  * Callback invoked by libVNCServer when it receives a CopyRect message.
  * CopyRect specified a rectangle of source data within the display and a
  * set of X/Y coordinates to which that rectangle should be copied.
