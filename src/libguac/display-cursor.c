@@ -32,12 +32,12 @@ guac_display_layer* guac_display_cursor(guac_display* display) {
 }
 
 void guac_display_set_cursor_hotspot(guac_display* display, int x, int y) {
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     display->pending_frame.cursor_hotspot_x = x;
     display->pending_frame.cursor_hotspot_y = y;
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 }
 
 void guac_display_set_cursor(guac_display* display,

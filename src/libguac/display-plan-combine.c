@@ -103,6 +103,12 @@ static int guac_display_plan_has_common_edge(const guac_display_plan_operation* 
  * Returns whether the given pair of operations should be combined into a
  * single operation.
  *
+ * @param plan
+ *     The plan containing op_a and op_b. Supplies the worker-balance
+ *     target (plan->img_combine_target_area) used to cap IMG+IMG
+ *     combines on frames where the existing 512x512 crosses-boundary
+ *     cap would over-collapse the plan.
+ *
  * @param op_a
  *     The first operation to check.
  *
@@ -113,7 +119,8 @@ static int guac_display_plan_has_common_edge(const guac_display_plan_operation* 
  *     Non-zero if the operations would be better represented as a single,
  *     combined operation, zero otherwise.
  */
-static int guac_display_plan_should_combine(const guac_display_plan_operation* op_a,
+static int guac_display_plan_should_combine(const guac_display_plan* plan,
+        const guac_display_plan_operation* op_a,
         const guac_display_plan_operation* op_b) {
 
     /* Operations can only be combined within the same layer */
@@ -150,17 +157,30 @@ static int guac_display_plan_should_combine(const guac_display_plan_operation* o
 
             /* Rectangle-drawing operations can be combined if they are
              * perfectly adjacent (exactly share an edge) and draw the same
-             * color */
+             * color. Adjacent translucent rects with non-identical (but
+             * compatible) colors are handled separately - see
+             * try_merge_translucent_rects() and its caller in
+             * guac_display_plan_combine_if_improved() below. */
             case GUAC_DISPLAY_PLAN_OPERATION_RECT:
-                return op_a->src.color == op_b->src.color
+                return op_a->src.rect.color == op_b->src.rect.color
                     && guac_display_plan_has_common_edge(op_a, op_b)
                     && !guac_display_plan_rect_crosses_boundary(&combined);
 
-            /* Image-drawing operations can be combined if doing so wouldn't
-             * exceed the size limits for images (we enforce size limits here
-             * to promote parallelism) */
-            case GUAC_DISPLAY_PLAN_OPERATION_IMG:
-                return !guac_display_plan_rect_crosses_boundary(&combined);
+            /* Image-drawing operations can be combined if doing so neither
+             * exceeds the 512x512 grid-cell cap (set by cross-boundary
+             * detection) nor exceeds the worker-balance target area.
+             * The cap enforces an absolute per-op encode ceiling; the
+             * target enforces rough balance across the encode worker
+             * pool so that small-area frames do not collapse to fewer
+             * ops than the pool can process in parallel. */
+            case GUAC_DISPLAY_PLAN_OPERATION_IMG: {
+                if (guac_display_plan_rect_crosses_boundary(&combined))
+                    return 0;
+                size_t combined_area =
+                        (size_t) guac_rect_width(&combined)
+                      * (size_t) guac_rect_height(&combined);
+                return combined_area <= plan->img_combine_target_area;
+            }
 
             /* Other combinations require more complex logic... (see below) */
             default:
@@ -197,8 +217,181 @@ static int guac_display_plan_should_combine(const guac_display_plan_operation* o
 }
 
 /**
+ * Minimum last-frame channel delta required across the combined sample set
+ * before the merged-α derivation is considered precise enough to be useful.
+ * Mirrors GUAC_DISPLAY_PLAN_TRANSLUCENT_MIN_DELTA from display-plan-rect.c
+ * - both passes must agree on the threshold.
+ */
+#define GUAC_DISPLAY_PLAN_TRANSLUCENT_MERGE_MIN_DELTA 16
+
+/**
+ * Attempts to merge two adjacent translucent RECT ops by deriving a single
+ * (α, src) approximation that satisfies the source-over equations for the
+ * sample pixels of both ops. The same most-distant-pair system of
+ * equations used for initial detection runs here over the four pooled
+ * samples (two from each op), and the merged approximation is verified
+ * against all four; if any sample falls outside the per-channel
+ * tolerance, the merge is rejected and the ops remain separate.
+ *
+ * On success, op_a's rect data is updated in place: the color is set to
+ * the merged (α, src), and the two stored sample pixels are replaced with
+ * the most-distant pair found across the merged sample set. This keeps
+ * future merges (chains of three or more rects) operating on increasingly
+ * representative samples - whatever pair currently spans the widest
+ * channel delta is preserved as the merge progresses.
+ *
+ * @param op_a
+ *     The translucent RECT op to absorb op_b into. On success, its
+ *     src.rect color and sample pixels are overwritten with the merged
+ *     approximation.
+ *
+ * @param op_b
+ *     The translucent RECT op being absorbed. Read-only here; the caller
+ *     transitions it to NOP after the rect extension.
+ *
+ * @return
+ *     Non-zero if a single (α, src) approximation satisfies all four
+ *     pooled samples within tolerance, zero otherwise.
+ */
+static int try_merge_translucent_rects(guac_display_plan_operation* op_a,
+        const guac_display_plan_operation* op_b) {
+
+    /* Pool the four sample pixels from both ops. */
+    uint32_t p[4] = {
+        op_a->src.rect.pending_a, op_a->src.rect.pending_b,
+        op_b->src.rect.pending_a, op_b->src.rect.pending_b
+    };
+    uint32_t l[4] = {
+        op_a->src.rect.last_a, op_a->src.rect.last_b,
+        op_b->src.rect.last_a, op_b->src.rect.last_b
+    };
+
+    /* Find the most-distant pair across all six (i, j) sample pairs and
+     * all three RGB channels. Maximizing |last_j - last_i| in some
+     * channel maximizes the precision of the α derivation below. */
+    int best_delta = 0;
+    int best_dl = 0, best_dp = 0;
+    int best_i = 0, best_j = 1;
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = i + 1; j < 4; j++) {
+
+            uint32_t li = l[i], lj = l[j];
+            if (li == lj)
+                continue;
+
+            uint32_t pi = p[i], pj = p[j];
+
+            for (int shift = 0; shift <= 16; shift += 8) {
+
+                int dl = (int)((lj >> shift) & 0xFF) - (int)((li >> shift) & 0xFF);
+                int adl = dl < 0 ? -dl : dl;
+                if (adl <= best_delta)
+                    continue;
+
+                int dp = (int)((pj >> shift) & 0xFF) - (int)((pi >> shift) & 0xFF);
+
+                /* Same sign requirement as the initial detection: a valid
+                 * source-over blend has 255 - α >= 0 so dp and dl share a
+                 * sign in every channel. */
+                if ((dl < 0) != (dp < 0))
+                    continue;
+
+                best_delta = adl;
+                best_dl = dl;
+                best_dp = dp;
+                best_i = i;
+                best_j = j;
+
+            }
+        }
+    }
+
+    if (best_delta < GUAC_DISPLAY_PLAN_TRANSLUCENT_MERGE_MIN_DELTA)
+        return 0;
+
+    /* Derive merged α via round-to-nearest division. */
+    int abs_dl = best_dl < 0 ? -best_dl : best_dl;
+    int abs_dp = best_dp < 0 ? -best_dp : best_dp;
+
+    int neg_alpha = (255 * abs_dp + abs_dl / 2) / abs_dl;
+    if (neg_alpha > 255)
+        return 0;
+    int alpha = 255 - neg_alpha;
+    if (alpha < 8)
+        return 0;
+
+    /* Derive merged src per channel via the source-over identity, using
+     * both pixels of the most-distant pair (the same averaging trick as
+     * the per-rect derivation, halving rounding-noise variance). */
+    uint32_t pi = p[best_i], li = l[best_i];
+    uint32_t pj = p[best_j], lj = l[best_j];
+
+    int p_sum_r = (int)((pi >> 16) & 0xFF) + (int)((pj >> 16) & 0xFF);
+    int p_sum_g = (int)((pi >>  8) & 0xFF) + (int)((pj >>  8) & 0xFF);
+    int p_sum_b = (int)( pi        & 0xFF) + (int)( pj        & 0xFF);
+    int l_sum_r = (int)((li >> 16) & 0xFF) + (int)((lj >> 16) & 0xFF);
+    int l_sum_g = (int)((li >>  8) & 0xFF) + (int)((lj >>  8) & 0xFF);
+    int l_sum_b = (int)( li        & 0xFF) + (int)( lj        & 0xFF);
+
+    int two_alpha = 2 * alpha;
+    int src_r = (255 * p_sum_r - neg_alpha * l_sum_r + alpha) / two_alpha;
+    int src_g = (255 * p_sum_g - neg_alpha * l_sum_g + alpha) / two_alpha;
+    int src_b = (255 * p_sum_b - neg_alpha * l_sum_b + alpha) / two_alpha;
+
+    if (src_r < 0) src_r = 0; else if (src_r > 255) src_r = 255;
+    if (src_g < 0) src_g = 0; else if (src_g > 255) src_g = 255;
+    if (src_b < 0) src_b = 0; else if (src_b > 255) src_b = 255;
+
+    /* Verify all four pooled samples satisfy the merged (α, src) within
+     * tolerance. The verification is in scaled space (α·src vs.
+     * 255·p - (255-α)·l) to mirror the per-pixel check used in the
+     * initial detection. */
+    int c_r = alpha * src_r;
+    int c_g = alpha * src_g;
+    int c_b = alpha * src_b;
+    int scaled_tolerance = 384 + alpha;
+
+    for (int k = 0; k < 4; k++) {
+
+        int sr = 255 * (int)((p[k] >> 16) & 0xFF) - neg_alpha * (int)((l[k] >> 16) & 0xFF);
+        int sg = 255 * (int)((p[k] >>  8) & 0xFF) - neg_alpha * (int)((l[k] >>  8) & 0xFF);
+        int sb = 255 * (int)( p[k]        & 0xFF) - neg_alpha * (int)( l[k]        & 0xFF);
+
+        int dr = sr - c_r; if (dr < 0) dr = -dr;
+        int dg = sg - c_g; if (dg < 0) dg = -dg;
+        int db = sb - c_b; if (db < 0) db = -db;
+
+        if (dr > scaled_tolerance || dg > scaled_tolerance || db > scaled_tolerance)
+            return 0;
+
+    }
+
+    /* Merge accepted - install the merged color and replace op_a's
+     * stored samples with the most-distant pair from the merged set, so
+     * subsequent merge attempts continue to work from the widest-spread
+     * pair available. */
+    op_a->src.rect.color     = ((uint32_t) alpha << 24)
+                             | ((uint32_t) src_r << 16)
+                             | ((uint32_t) src_g <<  8)
+                             |  (uint32_t) src_b;
+    op_a->src.rect.pending_a = pi;
+    op_a->src.rect.last_a    = li;
+    op_a->src.rect.pending_b = pj;
+    op_a->src.rect.last_b    = lj;
+
+    return 1;
+
+}
+
+/**
  * Combines the given pair of operations into a single operation if doing so is
  * advantageous (results in an operation of lesser or negligibly-worse cost).
+ *
+ * @param plan
+ *     The plan containing op_a and op_b. Passed through to
+ *     guac_display_plan_should_combine() so the worker-balance target
+ *     can gate IMG+IMG combines.
  *
  * @param op_a
  *     The first of the pair of operations to be combined. If they operations
@@ -213,15 +406,50 @@ static int guac_display_plan_should_combine(const guac_display_plan_operation* o
  * @return
  *     Non-zero if the operations were combined, zero otherwise.
  */
-static int guac_display_plan_combine_if_improved(guac_display_plan_operation* op_a,
+static int guac_display_plan_combine_if_improved(guac_display_plan* plan,
+        guac_display_plan_operation* op_a,
         guac_display_plan_operation* op_b) {
 
     if (op_a == op_b)
         return 0;
 
+    /* Special path: two adjacent translucent RECT ops (alpha < 0xFF in
+     * each) may share a single (α, src) approximation that satisfies
+     * both. The standard same-color check below would miss them since
+     * each derives slightly different (α, src) from its own pixel data;
+     * instead, pool their four sample pixels, derive a merged (α, src)
+     * via the same system of equations used in the initial detection,
+     * and accept the merge only if all four samples fall within
+     * tolerance. This avoids fading-image regions getting fragmented
+     * into many small per-cell rects when a few large ones would render
+     * the same result. */
+    if (op_a->type == GUAC_DISPLAY_PLAN_OPERATION_RECT
+            && op_b->type == GUAC_DISPLAY_PLAN_OPERATION_RECT
+            && op_a->layer == op_b->layer
+            && (op_a->src.rect.color & 0xFF000000u) != 0xFF000000u
+            && (op_b->src.rect.color & 0xFF000000u) != 0xFF000000u) {
+
+        guac_rect combined = op_a->dest;
+        guac_rect_extend(&combined, &op_b->dest);
+
+        if (guac_display_plan_has_common_edge(op_a, op_b)
+                && !guac_display_plan_rect_crosses_boundary(&combined)
+                && try_merge_translucent_rects(op_a, op_b)) {
+
+            guac_rect_extend(&op_a->dest, &op_b->dest);
+            op_a->dirty_size += op_b->dirty_size;
+            if (op_b->last_frame > op_a->last_frame)
+                op_a->last_frame = op_b->last_frame;
+            op_b->type = GUAC_DISPLAY_PLAN_OPERATION_NOP;
+            return 1;
+
+        }
+
+    }
+
     /* Combine any adjacent operations that match the combination criteria
      * (combining produces a net lower cost) */
-    if (guac_display_plan_should_combine(op_a, op_b)) {
+    if (guac_display_plan_should_combine(plan, op_a, op_b)) {
 
         guac_rect_extend(&op_a->dest, &op_b->dest);
 
@@ -249,7 +477,60 @@ static int guac_display_plan_combine_if_improved(guac_display_plan_operation* op
 
 }
 
+/**
+ * Minimum IMG combine target area (in pixels). Combines producing an IMG
+ * op of this area or less are always permitted by the worker-balance
+ * check, regardless of total_img_area / worker_count. Set to two
+ * 64x64 cells so the common case of combining a pair of adjacent
+ * cells horizontally or vertically is never blocked by the balance
+ * target even on tiny frames.
+ */
+#define GUAC_DISPLAY_PLAN_IMG_COMBINE_FLOOR_AREA \
+    (2 * GUAC_DISPLAY_CELL_SIZE * GUAC_DISPLAY_CELL_SIZE)
+
+/**
+ * Computes the per-op IMG target area for the combine phase and stores
+ * it on the plan. Must be called before the horizontal and vertical
+ * combine passes, as both consult plan->img_combine_target_area to
+ * gate IMG+IMG merges.
+ *
+ * The target is total_img_area / encode_worker_count, floored at
+ * GUAC_DISPLAY_PLAN_IMG_COMBINE_FLOOR_AREA so the balance heuristic
+ * never blocks combines of pairs of adjacent 64x64 cells (those tiny
+ * combines pay for their protocol overhead several times over even
+ * when parallelism is the priority). The 512x512 crosses-boundary
+ * cap in guac_display_plan_rect_crosses_boundary() continues to
+ * enforce the absolute per-op ceiling above the target.
+ */
+static void compute_img_combine_target(guac_display_plan* plan) {
+
+    size_t total_img_area = 0;
+    for (int i = 0; i < plan->length; i++) {
+        if (plan->ops[i].type == GUAC_DISPLAY_PLAN_OPERATION_IMG) {
+            total_img_area +=
+                    (size_t) guac_rect_width(&plan->ops[i].dest)
+                  * (size_t) guac_rect_height(&plan->ops[i].dest);
+        }
+    }
+
+    int workers = plan->display->encode_stage.thread_count;
+    if (workers < 1)
+        workers = 1;
+
+    size_t target = total_img_area / (size_t) workers;
+    if (target < GUAC_DISPLAY_PLAN_IMG_COMBINE_FLOOR_AREA)
+        target = GUAC_DISPLAY_PLAN_IMG_COMBINE_FLOOR_AREA;
+
+    plan->img_combine_target_area = target;
+
+}
+
 void PFW_guac_display_plan_combine_horizontally(guac_display_plan* plan) {
+
+    /* Compute the worker-balance target once before the horizontal and
+     * vertical combine passes. Both passes read plan->img_combine_
+     * target_area to gate IMG+IMG merges. */
+    compute_img_combine_target(plan);
 
     guac_display* display = plan->display;
     guac_display_layer* current = display->pending_frame.layers;
@@ -270,7 +551,7 @@ void PFW_guac_display_plan_combine_horizontally(guac_display_plan* plan) {
 
                     /* Combine adjacent updates if doing so is advantageous */
                     if (previous->related_op != NULL && cell->related_op != NULL
-                            && guac_display_plan_combine_if_improved(previous->related_op, cell->related_op)) {
+                            && guac_display_plan_combine_if_improved(plan, previous->related_op, cell->related_op)) {
                         cell->related_op = previous->related_op;
                     }
 
@@ -312,7 +593,7 @@ void PFW_guac_display_plan_combine_vertically(guac_display_plan* plan) {
                     /* Combine adjacent updates if doing so is advantageous */
                     if (previous->related_op != NULL && cell->related_op != NULL
                             && guac_display_plan_has_common_edge(previous->related_op, cell->related_op)
-                            && guac_display_plan_combine_if_improved(previous->related_op, cell->related_op)) {
+                            && guac_display_plan_combine_if_improved(plan, previous->related_op, cell->related_op)) {
                         cell->related_op = previous->related_op;
                     }
 

@@ -115,6 +115,7 @@ libguacprivinc_HEADERS =              \
 noinst_HEADERS =              \
     display-atomic.h          \
     display-builtin-cursors.h \
+    display-pipeline.h        \
     display-plan.h            \
     display-priv.h            \
     encode-jpeg.h             \
@@ -136,6 +137,7 @@ libguac_la_SOURCES =          \
     display-flush.c           \
     display-layer.c           \
     display-layer-list.c      \
+    display-pipeline.c        \
     display-plan.c            \
     display-plan-combine.c    \
     display-plan-rect.c       \

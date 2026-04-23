@@ -17,6 +17,8 @@
  * under the License.
  */
 
+#include "config.h"
+
 #include "display-priv.h"
 #include "guacamole/assert.h"
 #include "guacamole/display.h"
@@ -48,7 +50,7 @@ static void PFW_guac_display_layer_touch(guac_display_layer* layer) {
 void guac_display_layer_get_bounds(guac_display_layer* layer, guac_rect* bounds) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_read_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     *bounds = (guac_rect) {
         .left   = 0,
@@ -57,108 +59,127 @@ void guac_display_layer_get_bounds(guac_display_layer* layer, guac_rect* bounds)
         .bottom = layer->pending_frame.height
     };
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_move(guac_display_layer* layer, int x, int y) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.x = x;
     layer->pending_frame.y = y;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_stack(guac_display_layer* layer, int z) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.z = z;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_set_parent(guac_display_layer* layer, const guac_display_layer* parent) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.parent = parent->layer;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_set_opacity(guac_display_layer* layer, int opacity) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.opacity = opacity;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_set_lossless(guac_display_layer* layer, int lossless) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.lossless = lossless;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_set_multitouch(guac_display_layer* layer, int touches) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     layer->pending_frame.touches = touches;
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 void guac_display_layer_resize(guac_display_layer* layer, int width, int height) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     PFW_guac_display_layer_resize(layer, width, height);
     PFW_guac_display_layer_touch(layer);
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
+/* Force loop vectorization of guac_display_layer_raw_context_set
+ * regardless of the surrounding optimization level. -O2 on GCC <12
+ * leaves -ftree-loop-vectorize off by default, so the plain pixel-
+ * store loop below would otherwise compile to scalar mov even on AVX2
+ * hardware. Enabling the vectorizer per-function lets auto-vec pick
+ * the widest store width the build target supports (SSE2, AVX2,
+ * AVX-512, NEON, SVE, RVV, ...) without requiring the caller to pass
+ * -O3 or to hand-write a fixed-width vector_size loop. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("tree-loop-vectorize")))
+#endif
 void guac_display_layer_raw_context_set(guac_display_layer_raw_context* context,
         const guac_rect* dst, uint32_t color) {
 
     size_t dst_stride = context->stride;
     unsigned char* restrict dst_buffer = GUAC_DISPLAY_LAYER_RAW_BUFFER(context, *dst);
+    int width = guac_rect_width(dst);
 
+    /* Plain counter loop with a local restrict-qualified pointer. The
+     * auto-vectorizer sees an unambiguous stride and scales the store
+     * width to whatever the build target supports - baseline SSE2
+     * emits paired 128-bit stores, AVX2 emits 256-bit stores, AVX-512
+     * emits 512-bit stores, NEON/SVE/RVV get their widest native
+     * width. Holding the compiler to a fixed vector_size(32) would
+     * cap us at 256-bit even on wider machines. */
     for (int dy = dst->top; dy < dst->bottom; dy++) {
 
-        uint32_t* dst_pixel = (uint32_t*) dst_buffer;
-        dst_buffer += dst_stride;
+        uint32_t* restrict dst_pixel = (uint32_t*) dst_buffer;
+        for (int dx = 0; dx < width; dx++)
+            dst_pixel[dx] = color;
 
-        for (int dx = dst->left; dx < dst->right; dx++)
-            *(dst_pixel++) = color;
+        dst_buffer += dst_stride;
 
     }
 
@@ -189,7 +210,17 @@ void guac_display_layer_raw_context_put(guac_display_layer_raw_context* context,
 guac_display_layer_raw_context* guac_display_layer_open_raw(guac_display_layer* layer) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+
+    /* Signal to any in-progress scroll-detection search (display-plan
+     * phase 3) that a drawing thread is about to block on this lock.
+     * If the search has not yet found any copies to justify its cost,
+     * it will drain its workers and abort so we can proceed sooner.
+     * See guac_hash_foreach_image_rect() for the abort-check. The
+     * flag is cleared once the acquire returns - from then on, any
+     * value the search reads is stale relative to this caller. */
+    atomic_store_explicit(&display->draw_pending, 1, memory_order_relaxed);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
+    atomic_store_explicit(&display->draw_pending, 0, memory_order_relaxed);
 
     /* Flush any outstanding Cairo operations before directly accessing buffer */
     guac_display_layer_cairo_context* cairo_context = &(layer->pending_frame_cairo_context);
@@ -264,14 +295,19 @@ void guac_display_layer_close_raw(guac_display_layer* layer, guac_display_layer_
     if (context->hint_from != NULL)
         context->hint_from->pending_frame.search_for_copies = 1;
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }
 
 guac_display_layer_cairo_context* guac_display_layer_open_cairo(guac_display_layer* layer) {
 
     guac_display* display = layer->display;
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+
+    /* See guac_display_layer_open_raw() for why draw_pending is toggled
+     * around the (possibly blocking) acquire. */
+    atomic_store_explicit(&display->draw_pending, 1, memory_order_relaxed);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
+    atomic_store_explicit(&display->draw_pending, 0, memory_order_relaxed);
 
     /* It is intentionally allowed that the pending frame buffer can be
      * replaced with NULL to ensure that references to external buffers can be
@@ -319,6 +355,6 @@ void guac_display_layer_close_cairo(guac_display_layer* layer, guac_display_laye
     if (context->hint_from != NULL)
         context->hint_from->pending_frame.search_for_copies = 1;
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
 }

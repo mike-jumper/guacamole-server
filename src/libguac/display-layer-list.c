@@ -248,7 +248,7 @@ static void PFW_guac_display_layer_pending_frame_cells_resize(guac_display_layer
 
 guac_display_layer* guac_display_add_layer(guac_display* display, guac_layer* layer, int opaque) {
 
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     /* Init core layer members */
     guac_display_layer* display_layer = guac_mem_zalloc(sizeof(guac_display_layer));
@@ -277,7 +277,7 @@ guac_display_layer* guac_display_add_layer(guac_display* display, guac_layer* la
     if (old_head != NULL)
         old_head->pending_frame.prev = display_layer;
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
     return display_layer;
 
@@ -291,7 +291,7 @@ void guac_display_remove_layer(guac_display_layer* display_layer) {
      * Remove layer from pending frame
      */
 
-    guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+    guac_flag_wait_and_lock(&display->pending_state, GUAC_DISPLAY_PENDING_WRITABLE);
 
     /* Update previous element, if it exists */
     if (display_layer->pending_frame.prev != NULL)
@@ -308,13 +308,13 @@ void guac_display_remove_layer(guac_display_layer* display_layer) {
     if (display_layer->pending_frame.next != NULL)
         display_layer->pending_frame.next->pending_frame.prev = display_layer->pending_frame.prev;
 
-    guac_rwlock_release_lock(&display->pending_frame.lock);
+    guac_flag_unlock(&display->pending_state);
 
     /*
      * Remove layer from last frame
      */
 
-    guac_rwlock_acquire_write_lock(&display->last_frame.lock);
+    guac_rwlock_acquire_write_lock(&display->last_frame_lock);
 
     /* Update previous element, if it exists */
     if (display_layer->last_frame.prev != NULL)
@@ -331,7 +331,7 @@ void guac_display_remove_layer(guac_display_layer* display_layer) {
     if (display_layer->last_frame.next != NULL)
         display_layer->last_frame.next->last_frame.prev = display_layer->last_frame.prev;
 
-    guac_rwlock_release_lock(&display->last_frame.lock);
+    guac_rwlock_release_lock(&display->last_frame_lock);
 
     /*
      * Layer has now been removed from both pending and last frame lists and
