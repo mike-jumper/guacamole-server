@@ -56,12 +56,77 @@ LOCATION="$2"
 # Pre-populate build control variables such that the custom build prefix is
 # used for C headers, locating libraries, etc.
 export CFLAGS="-I${PREFIX_DIR}/include"
+export CXXFLAGS="-I${PREFIX_DIR}/include"
 export LDFLAGS="-L${PREFIX_DIR}/lib"
-export PKG_CONFIG_PATH="${PREFIX_DIR}/lib/pkgconfig" 
+export PKG_CONFIG_PATH="${PREFIX_DIR}/lib/pkgconfig"
+
+# Have CMake's find_package() prefer our from-source dependencies in
+# PREFIX_DIR over anything apk-installed in /usr. Matches the effect CFLAGS/
+# LDFLAGS already have on pkg-config-driven discovery. Without this, a
+# find_package(ZLIB) inside a CMake dep (libssh2, FreeRDP, ...) could pick
+# up Alpine's /usr/lib/libz.so and ignore our zlib-ng in the prefix.
+export CMAKE_PREFIX_PATH="${PREFIX_DIR}"
 
 # Ensure thread stack size will be 8 MB (glibc's default on Linux) rather than
 # 128 KB (musl's default)
 export LDFLAGS="$LDFLAGS -Wl,-z,stack-size=8388608"
+
+# Derive an architecture-specific -march flag from docker buildx's
+# TARGETARCH/TARGETVARIANT when available (they're populated automatically
+# for each platform in a multi-platform buildx invocation). This flag goes
+# into CFLAGS/CXXFLAGS for every dependency and guacamole-server itself,
+# so every compute-heavy library in the image - FreeRDP, libjpeg-turbo,
+# libwebp, libguac - picks up ISA-specific codegen matching the variant
+# the buildx manifest will publish the image as.
+#
+# The mapping follows the standard x86-64 microarchitecture levels and
+# the ARM baselines:
+#
+#   amd64          (no variant)  -> -march=x86-64     (SSE2 baseline, 2003)
+#   amd64/v2                     -> -march=x86-64-v2  (SSE4.2,  ~2008)
+#   amd64/v3                     -> -march=x86-64-v3  (AVX2,    ~2013)
+#   amd64/v4                     -> -march=x86-64-v4  (AVX-512, ~2017)
+#   arm64          (no variant)  -> -march=armv8-a    (NEON always present)
+#   arm/v7                       -> -march=armv7-a    (NEON optional)
+#
+# buildx uses the Go-style architecture names (amd64, arm64, arm). For
+# manual (non-buildx) docker builds where TARGETARCH is unset, we fall
+# back to `uname -m` of the build host and use baseline flags - matching
+# the previous behavior on manual builds.
+if [ -z "$TARGETARCH" ]; then
+    case "$(uname -m)" in
+        x86_64)          TARGETARCH="amd64" ;;
+        aarch64|arm64)   TARGETARCH="arm64" ;;
+        armv7l|armv6l)   TARGETARCH="arm"   ;;
+        i386|i686)       TARGETARCH="386"   ;;
+    esac
+fi
+
+MARCH=""
+case "$TARGETARCH" in
+    amd64)
+        case "$TARGETVARIANT" in
+            v4) MARCH="x86-64-v4" ;;
+            v3) MARCH="x86-64-v3" ;;
+            v2) MARCH="x86-64-v2" ;;
+            *)  MARCH="x86-64"    ;;
+        esac
+        ;;
+    arm64)
+        MARCH="armv8-a"
+        ;;
+    arm)
+        MARCH="armv7-a"
+        ;;
+esac
+
+if [ -n "$MARCH" ]; then
+    export CFLAGS="$CFLAGS -march=$MARCH"
+    export CXXFLAGS="$CXXFLAGS -march=$MARCH"
+    echo "Targeting -march=$MARCH (TARGETARCH=${TARGETARCH:-<unset>} TARGETVARIANT=${TARGETVARIANT:-<unset>})"
+else
+    echo "No -march set (TARGETARCH=${TARGETARCH:-<unset>} TARGETVARIANT=${TARGETVARIANT:-<unset>})"
+fi
 
 PATTERN_VAR="WITH_${VAR_BASE}"
 PATTERN="$(printenv "${PATTERN_VAR}" || true)"

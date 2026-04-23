@@ -30,6 +30,16 @@ ARG ALPINE_BASE_IMAGE=3.18
 # default, this is detected automatically.
 ARG BUILD_ARCHITECTURE
 
+# Populated automatically by docker buildx for each platform in a
+# multi-platform build (e.g. TARGETARCH=amd64, TARGETVARIANT=v3 for
+# linux/amd64/v3). autobuild.sh reads these to pick an appropriate
+# -march flag so every compute-heavy library is specialized for the
+# microarchitecture level the resulting image will be published as.
+# When unset (manual `docker build` without buildx), autobuild.sh falls
+# back to the build host's `uname -m` and uses baseline flags.
+ARG TARGETARCH
+ARG TARGETVARIANT
+
 # The number of processes that may run simultaneously during the build. By
 # default, this is detected automatically.
 ARG BUILD_JOBS
@@ -54,7 +64,9 @@ ARG WITH_FREERDP="${FREERDP_VERSION}(\.\d+)+"
 ARG WITH_LIBSSH2='libssh2-\d+(\.\d+)+'
 ARG WITH_LIBTELNET='\d+(\.\d+)+'
 ARG WITH_LIBVNCCLIENT='LibVNCServer-\d+(\.\d+)+'
+ARG WITH_LIBWEBP='v\d+(\.\d+)+'
 ARG WITH_LIBWEBSOCKETS='v\d+(\.\d+)+'
+ARG WITH_ZLIB_NG='\d+(\.\d+)+'
 
 #
 # Default build options for each core protocol support library, as well as
@@ -138,6 +150,30 @@ ARG LIBVNCCLIENT_OPTS=""
 
 ARG LIBVNCCLIENT_X86_OPTS=""
 
+ARG LIBWEBP_ARM_OPTS=""
+
+# libwebp is built with everything except the core shared library disabled.
+# We consume libwebp programmatically through guac_webp_write() and don't need
+# any of the command-line tools, helper libraries, or companion formats.
+# WEBP_BUILD_*=OFF keeps the stage narrow, CMake autodetects SIMD features
+# (SSE2/SSE4.1/AVX2/NEON) based on the compile target, so nothing extra to
+# pass - our autobuild.sh sets CFLAGS=-march=... per TARGETARCH/TARGETVARIANT
+# and libwebp picks up the feature macros from that.
+ARG LIBWEBP_OPTS="\
+    -DBUILD_SHARED_LIBS=ON \
+    -DWEBP_BUILD_ANIM_UTILS=OFF \
+    -DWEBP_BUILD_CWEBP=OFF \
+    -DWEBP_BUILD_DWEBP=OFF \
+    -DWEBP_BUILD_EXTRAS=OFF \
+    -DWEBP_BUILD_GIF2WEBP=OFF \
+    -DWEBP_BUILD_IMG2WEBP=OFF \
+    -DWEBP_BUILD_LIBWEBPMUX=OFF \
+    -DWEBP_BUILD_VWEBP=OFF \
+    -DWEBP_BUILD_WEBPINFO=OFF \
+    -DWEBP_BUILD_WEBPMUX=OFF"
+
+ARG LIBWEBP_X86_OPTS=""
+
 ARG LIBWEBSOCKETS_ARM_OPTS=""
 
 ARG LIBWEBSOCKETS_OPTS="\
@@ -152,6 +188,26 @@ ARG LIBWEBSOCKETS_OPTS="\
 
 ARG LIBWEBSOCKETS_X86_OPTS=""
 
+ARG ZLIB_NG_ARM_OPTS=""
+
+# zlib-ng is built in compat mode: produces libz.so.1 with the same ABI as
+# vanilla zlib, so it becomes a true drop-in replacement at runtime via
+# LD_LIBRARY_PATH. Every consumer of DEFLATE in the image (libpng, OpenSSL,
+# libwebsockets, FreeRDP, ...) transparently picks up SIMD-accelerated
+# compress/decompress with no source changes.
+#
+# Tests and gtest are disabled since they're not meaningful for the runtime
+# image. CMake autodetects SIMD features (SSE2/SSSE3/PCLMUL/AVX2/AVX-512)
+# from the compile target - autobuild.sh's CFLAGS=-march=... from
+# TARGETARCH/TARGETVARIANT drives the selection.
+ARG ZLIB_NG_OPTS="\
+    -DZLIB_COMPAT=ON \
+    -DZLIB_ENABLE_TESTS=OFF \
+    -DWITH_GTEST=OFF \
+    -DBUILD_SHARED_LIBS=ON"
+
+ARG ZLIB_NG_X86_OPTS=""
+
 #
 # Base builder image that will be used by subsequent build stages, including
 # for building dependencies of guacamole-server.
@@ -160,7 +216,14 @@ ARG LIBWEBSOCKETS_X86_OPTS=""
 FROM alpine:${ALPINE_BASE_IMAGE} AS builder
 ARG BUILD_DIR
 
-# Install build dependencies
+# Install build dependencies. libwebp is intentionally omitted - we build it
+# ourselves from source in the libwebp stage below so the AVX2 encoder
+# paths introduced in libwebp 1.4 (and later) activate under the
+# appropriate -march for the target platform, which Alpine 3.18's
+# libwebp-dev (1.3.x) predates. zlib-dev is retained here only to satisfy
+# build-time header requirements of other apk packages - the runtime libz
+# is overridden to our from-source zlib-ng (compat mode) via
+# LD_LIBRARY_PATH.
 RUN apk add --no-cache                \
         autoconf                      \
         automake                      \
@@ -175,7 +238,6 @@ RUN apk add --no-cache                \
         libjpeg-turbo-dev             \
         libpng-dev                    \
         libtool                       \
-        libwebp-dev                   \
         make                          \
         openssl1.1-compat-dev         \
         pango-dev                     \
@@ -189,16 +251,66 @@ RUN apk add --no-cache                \
 COPY ./src/guacd-docker/bin/autobuild.sh ${BUILD_DIR}/src/guacd-docker/bin/
 
 #
+# Build dependency: zlib-ng
+#
+# Compiled in compat mode (libz.so.1), so it becomes the runtime libz for
+# every consumer of DEFLATE in the final image once LD_LIBRARY_PATH prefers
+# /opt/guacamole/lib over /usr/lib. CMake picks appropriate SIMD paths
+# (SSE2/SSSE3/PCLMUL/AVX2/AVX-512 on x86, NEON on ARM) based on the
+# -march= autobuild.sh derives from TARGETARCH/TARGETVARIANT.
+#
+
+FROM builder AS zlib-ng
+ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG PREFIX_DIR
+ARG WITH_ZLIB_NG
+ARG ZLIB_NG_ARM_OPTS
+ARG ZLIB_NG_OPTS
+ARG ZLIB_NG_X86_OPTS
+
+RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "ZLIB_NG" \
+    "https://github.com/zlib-ng/zlib-ng"
+
+#
+# Build dependency: libwebp
+#
+# Built from source (rather than taken from apk) so libwebp 1.4+ AVX2
+# encoder paths activate under the appropriate -march= for the target
+# platform variant. Alpine 3.18 ships libwebp 1.3.x, which predates AVX2.
+#
+
+FROM builder AS libwebp
+ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG LIBWEBP_ARM_OPTS
+ARG LIBWEBP_OPTS
+ARG LIBWEBP_X86_OPTS
+ARG PREFIX_DIR
+ARG WITH_LIBWEBP
+
+RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBWEBP" \
+    "https://github.com/webmproject/libwebp"
+
+#
 # Build dependency: libssh2
 #
 
 FROM builder AS libssh2
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG LIBSSH2_ARM_OPTS
 ARG LIBSSH2_OPTS
 ARG LIBSSH2_X86_OPTS
 ARG PREFIX_DIR
 ARG WITH_LIBSSH2
+
+# libssh2 uses zlib for its compression support. Pull in zlib-ng so
+# libssh2's find_package(ZLIB) picks up our SIMD-accelerated build.
+COPY --from=zlib-ng ${PREFIX_DIR} ${PREFIX_DIR}
 
 RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBSSH2" \
     "https://github.com/libssh2/libssh2"
@@ -209,6 +321,8 @@ RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBSSH2" \
 
 FROM builder AS libtelnet
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG LIBTELNET_ARM_OPTS
 ARG LIBTELNET_OPTS
 ARG LIBTELNET_X86_OPTS
@@ -224,11 +338,19 @@ RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBTELNET" \
 
 FROM builder AS libvncclient
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG LIBVNCCLIENT_ARM_OPTS
 ARG LIBVNCCLIENT_OPTS
 ARG LIBVNCCLIENT_X86_OPTS
 ARG PREFIX_DIR
 ARG WITH_LIBVNCCLIENT
+
+# libvncclient uses zlib for the Tight encoding and libwebp for
+# WebP-over-VNC updates, so ensure libvncclient's build finds our
+# from-source versions rather than Alpine's packages.
+COPY --from=zlib-ng ${PREFIX_DIR} ${PREFIX_DIR}
+COPY --from=libwebp ${PREFIX_DIR} ${PREFIX_DIR}
 
 RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBVNCCLIENT" \
     "https://github.com/LibVNC/libvncserver"
@@ -239,11 +361,18 @@ RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBVNCCLIENT" \
 
 FROM builder AS libwebsockets
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG LIBWEBSOCKETS_ARM_OPTS
 ARG LIBWEBSOCKETS_OPTS
 ARG LIBWEBSOCKETS_X86_OPTS
 ARG PREFIX_DIR
 ARG WITH_LIBWEBSOCKETS
+
+# libwebsockets uses zlib for permessage-deflate, so pull in zlib-ng to
+# benefit from SIMD-accelerated compression on every WebSocket frame that
+# negotiates compression.
+COPY --from=zlib-ng ${PREFIX_DIR} ${PREFIX_DIR}
 
 RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBWEBSOCKETS" \
     "https://github.com/warmcat/libwebsockets"
@@ -254,11 +383,19 @@ RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "LIBWEBSOCKETS" \
 
 FROM builder AS freerdp
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG FREERDP_ARM_OPTS
 ARG FREERDP_OPTS
 ARG FREERDP_X86_OPTS
 ARG PREFIX_DIR
 ARG WITH_FREERDP
+
+# FreeRDP uses zlib (WITH_ZLIB=ON) for channel compression and libwebp for
+# some bitmap codecs. Both of these come from our from-source builds so
+# they pick up SIMD-accelerated codegen for the target platform variant.
+COPY --from=zlib-ng ${PREFIX_DIR} ${PREFIX_DIR}
+COPY --from=libwebp ${PREFIX_DIR} ${PREFIX_DIR}
 
 RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "FREERDP" \
     "https://github.com/FreeRDP/FreeRDP"
@@ -270,13 +407,23 @@ RUN ${BUILD_DIR}/src/guacd-docker/bin/autobuild.sh "FREERDP" \
 
 FROM builder AS guacamole-server
 ARG BUILD_DIR
+ARG TARGETARCH
+ARG TARGETVARIANT
 ARG FREERDP_VERSION
 ARG GUACAMOLE_SERVER_ARM_OPTS
 ARG GUACAMOLE_SERVER_OPTS
 ARG GUACAMOLE_SERVER_X86_OPTS
 ARG PREFIX_DIR
 
-# Copy dependencies built in previous stages
+# Copy dependencies built in previous stages. Order matters only for
+# overlapping files; each stage writes disjoint subsets of PREFIX_DIR
+# so the composition is idempotent regardless of order. zlib-ng and
+# libwebp come first since their libraries/headers are consumed by
+# the guacamole-server build (libguac links libwebp for encoding,
+# libpng/freerdp/etc. pick up libz.so.1 via LD_LIBRARY_PATH at runtime
+# and via the linker search path at link time).
+COPY --from=zlib-ng ${PREFIX_DIR} ${PREFIX_DIR}
+COPY --from=libwebp ${PREFIX_DIR} ${PREFIX_DIR}
 COPY --from=freerdp ${PREFIX_DIR} ${PREFIX_DIR}
 COPY --from=libssh2 ${PREFIX_DIR} ${PREFIX_DIR}
 COPY --from=libtelnet ${PREFIX_DIR} ${PREFIX_DIR}
