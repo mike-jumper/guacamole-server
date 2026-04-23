@@ -113,6 +113,7 @@ libguacprivinc_HEADERS =              \
 #
 
 noinst_HEADERS =              \
+    display-atomic.h          \
     display-builtin-cursors.h \
     display-plan.h            \
     display-priv.h            \

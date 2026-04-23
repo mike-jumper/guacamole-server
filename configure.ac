@@ -53,6 +53,140 @@ AC_DEFINE([_GNU_SOURCE], [1], [Use GNU sources (if available)])
 # several possible routes for determining the number of available processors)
 AC_CHECK_FUNCS([sched_getaffinity])
 
+# Check for C11 <stdatomic.h>. Used by guac_display to coordinate concurrent
+# access to the per-plan ops_by_hash table and its associated occupancy
+# bitmap from multiple worker threads. Relaxed memory ordering is sufficient
+# here; the parallel-for barrier supplies any needed release/acquire
+# synchronization between the index and search phases.
+#
+# If the selected C mode (from AC_PROG_CC_C99 above) does not already enable
+# <stdatomic.h>, this check retries with -std=c11 appended to CFLAGS. If
+# that works, -std=c11 is preserved in CFLAGS for the remainder of the
+# build. If neither attempt succeeds (e.g. a conforming C11 implementation
+# that defines __STDC_NO_ATOMICS__), configure fails with an error: the
+# only plausible fallback would be a global mutex serializing every atomic
+# operation on the per-frame hot path, which would catastrophically
+# regress performance and is not a useful build mode for guac_display.
+AC_MSG_CHECKING([for C11 <stdatomic.h>])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#if defined(__STDC_NO_ATOMICS__)
+# error "C11 atomics not available"
+#endif
+]], [[
+    _Atomic uint8_t b = 0;
+    _Atomic uint64_t h = 0;
+    _Atomic(void*) p = NULL;
+    void* expected = NULL;
+    (void) atomic_load_explicit(&b, memory_order_relaxed);
+    (void) atomic_load_explicit(&h, memory_order_relaxed);
+    (void) atomic_fetch_or_explicit(&b, (uint8_t) 1, memory_order_relaxed);
+    (void) atomic_fetch_and_explicit(&b, (uint8_t) ~1, memory_order_relaxed);
+    (void) atomic_exchange_explicit(&p, (void*) 1, memory_order_relaxed);
+    (void) atomic_compare_exchange_strong_explicit(&p, &expected, (void*) 1,
+            memory_order_relaxed, memory_order_relaxed);
+]])],
+[have_stdatomic=yes
+ AC_MSG_RESULT([yes])],
+[guac_saved_CFLAGS="$CFLAGS"
+ CFLAGS="$CFLAGS -std=c11"
+ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#if defined(__STDC_NO_ATOMICS__)
+# error "C11 atomics not available"
+#endif
+]], [[
+    _Atomic uint8_t b = 0;
+    _Atomic uint64_t h = 0;
+    _Atomic(void*) p = NULL;
+    void* expected = NULL;
+    (void) atomic_load_explicit(&b, memory_order_relaxed);
+    (void) atomic_load_explicit(&h, memory_order_relaxed);
+    (void) atomic_fetch_or_explicit(&b, (uint8_t) 1, memory_order_relaxed);
+    (void) atomic_fetch_and_explicit(&b, (uint8_t) ~1, memory_order_relaxed);
+    (void) atomic_exchange_explicit(&p, (void*) 1, memory_order_relaxed);
+    (void) atomic_compare_exchange_strong_explicit(&p, &expected, (void*) 1,
+            memory_order_relaxed, memory_order_relaxed);
+]])],
+ [have_stdatomic="yes (with -std=c11)"
+  AC_MSG_RESULT([yes (with -std=c11)])],
+ [CFLAGS="$guac_saved_CFLAGS"
+  AC_MSG_RESULT([no])
+  AC_MSG_ERROR([C11 <stdatomic.h> is required but was not found. A
+compiler that supports C11 atomics (e.g. GCC 4.9+ or Clang 3.3+) is
+required to build guacamole-server; the per-frame concurrent access
+patterns in guac_display cannot be supported by any slower fallback
+without a severe performance regression.])])])
+
+# Check for GCC/Clang vector extensions (__attribute__((vector_size(N)))),
+# used to SIMD-accelerate the 2D rolling-hash inner loop in guac_display.
+# When unavailable, a scalar implementation is used instead.
+AC_MSG_CHECKING([for __attribute__((vector_size))])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <stdint.h>
+typedef uint64_t v4u64 __attribute__((vector_size(32)));
+static v4u64 f(v4u64 a, v4u64 b) { return (a << 6) - (a << 1) + b; }
+]], [[
+    v4u64 a = { 0 }, b = { 0 };
+    v4u64 c = f(a, b);
+    (void) c;
+]])],
+[have_vector_extensions=yes
+ AC_DEFINE([HAVE_VECTOR_EXTENSIONS], [1],
+    [Define to 1 if the compiler supports __attribute__((vector_size(N)))])
+ AC_MSG_RESULT([yes])],
+[have_vector_extensions=no
+ AC_MSG_RESULT([no])])
+
+# Check for GCC/Clang function multiversioning via target_clones, used to
+# emit runtime-dispatched SIMD variants of the hot display loops alongside
+# the default SSE2 variant. When unavailable, only the single default
+# variant is emitted.
+#
+# Probes a list of candidate x86 feature strings from widest to narrowest,
+# selecting the widest one the compiler accepts. This keeps older
+# toolchains (e.g. a GCC that rejects "avx512f" but still recognizes
+# "avx2") from tripping at source-compile time while still giving newer
+# toolchains maximum dispatch granularity. The selected list is emitted
+# as GUAC_DISPLAY_TARGET_CLONES_X86 in config.h, which the source files
+# then pass to __attribute__((target_clones(...))) via macro expansion.
+have_target_clones=no
+guac_target_clones_list=""
+AC_MSG_CHECKING([for __attribute__((target_clones))])
+for features in \
+    "default,sse4.2,avx2,avx512f" \
+    "default,sse4.2,avx2" \
+    "default,avx2" \
+    "avx2,default"; do
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target_clones("]$features[")))
+static int clone_test(int x) { return x + 1; }
+#else
+static int clone_test(int x) { return x + 1; }
+#endif
+    ]], [[
+        (void) clone_test(0);
+    ]])],
+    [have_target_clones=yes
+     guac_target_clones_list="$features"])
+    test "x$have_target_clones" = "xyes" && break
+done
+if test "x$have_target_clones" = "xyes"; then
+    AC_DEFINE([HAVE_ATTRIBUTE_TARGET_CLONES], [1],
+        [Define to 1 if the compiler supports __attribute__((target_clones(...)))])
+    AC_DEFINE_UNQUOTED([GUAC_DISPLAY_TARGET_CLONES_X86],
+        ["$guac_target_clones_list"],
+        [The widest target_clones feature string the compiler accepts, used to emit runtime-dispatched SIMD variants of the hot display loops.])
+    AC_MSG_RESULT([yes (${guac_target_clones_list})])
+else
+    AC_MSG_RESULT([no])
+fi
+
 # Check for whether math library is required
 AC_CHECK_LIB([m], [cos],
              [MATH_LIBS=-lm],
@@ -1545,6 +1679,12 @@ $PACKAGE_NAME version $PACKAGE_VERSION
       guacd ...... ${build_guacd}
       guacenc .... ${build_guacenc}
       guaclog .... ${build_guaclog}
+
+   Display optimizations:
+
+      C11 atomics ........... ${have_stdatomic}
+      SIMD vector extensions  ${have_vector_extensions}
+      Runtime SIMD dispatch . ${have_target_clones}
 
    FreeRDP plugins: ${build_rdp_plugins}
    Init scripts: ${build_init}
