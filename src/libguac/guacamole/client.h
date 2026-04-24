@@ -756,6 +756,64 @@ int guac_client_get_processing_lag(guac_client* client);
 int guac_client_get_throughput(guac_client* client);
 
 /**
+ * Returns the number of milliseconds the caller should wait before
+ * emitting the next frame, derived per-user from the in-flight byte
+ * total and the user's effective throughput, then aggregated across
+ * users (max wait wins, since a fast user is fine to wait for the
+ * slowest one).
+ *
+ * Per-user calculation, when at least one throughput sample exists:
+ *
+ *   T            = min(bytes_per_ms, processing_bytes_per_ms),
+ *                  zero on either leg treated as unknown / fall-
+ *                  through, floored at GUAC_CLIENT_MIN_THROUGHPUT
+ *   t_oldest     = timestamp of the oldest un-acked sync still in
+ *                  the user's sync_emit_history ring
+ *   bytes        = sum_ring_bytes (running total of in-flight
+ *                  per-frame byte counts)
+ *   half_rtt     = last_frame_duration / 2 (one-way latency
+ *                  estimate)
+ *   ready_at     = t_oldest + half_rtt + bytes / T
+ *   wait         = max(0, ready_at - now)
+ *
+ * "Ready_at" is the projected server-clock time at which the
+ * client will have finished receiving and processing everything
+ * currently in flight - sum of one-way transit (half_rtt + bytes/
+ * T at the bottleneck rate) starting from the oldest un-acked
+ * emit. Using min(net, processing) for T captures whichever stage
+ * of the client pipeline is the bottleneck; bytes/T then measures
+ * how long the bottleneck needs to drain.
+ *
+ * Per-user fallback when no throughput sample exists yet (first
+ * frames of a connection, or pure pre-display callers):
+ *
+ *   wait = max(0, processing_lag - (now - last_sent_timestamp))
+ *
+ * which matches the historical lag-based behaviour and lets the
+ * pacing loop produce sensible numbers before the EMAs warm up.
+ *
+ * The caller is expected to apply this in a sync-preemptible loop:
+ * an arriving sync ack reduces in-flight bytes (and may advance
+ * t_oldest), so re-querying after each ack tightens the wait when
+ * the client catches up early.
+ *
+ * @param client
+ *     The guac_client to query.
+ *
+ * @param now
+ *     The current server-clock time, as returned by
+ *     guac_timestamp_current. Passed in rather than sampled
+ *     internally so the caller can use the same value for the
+ *     subsequent wait/sleep arithmetic.
+ *
+ * @return
+ *     Number of milliseconds the caller should wait before
+ *     emitting the next frame, or zero if no wait is suggested.
+ */
+int guac_client_get_pacing_wait_ms(guac_client* client,
+        guac_timestamp now);
+
+/**
  * Sends a request to the owner of the given guac_client for parameters required
  * to continue the connection started by the client. The function returns zero
  * on success or non-zero on failure.

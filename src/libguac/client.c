@@ -935,6 +935,123 @@ int guac_client_get_throughput(guac_client* client) {
 
 }
 
+/**
+ * State for the guac_client_foreach_user() callback that computes
+ * per-user pacing-wait contributions. "now" is the caller-provided
+ * server-clock snapshot; max_wait is the running maximum across
+ * users, updated in place.
+ */
+typedef struct __pacing_wait_args {
+    guac_timestamp now;
+    int max_wait;
+} __pacing_wait_args;
+
+/**
+ * guac_client_foreach_user() callback that computes the given
+ * user's contribution to the frame-pacing wait and folds it into
+ * args->max_wait. See guac_client_get_pacing_wait_ms for the full
+ * formula and the lag-based fallback.
+ */
+static void* __compute_pacing_wait(guac_user* user, void* data) {
+
+    __pacing_wait_args* args = (__pacing_wait_args*) data;
+
+    /* Effective per-user throughput T = min(network, processing),
+     * with a zero on either leg treated as unknown (fall through
+     * to whatever the other leg reports). T == 0 means no sample
+     * on either leg, which routes this user to the lag-based
+     * fallback below. */
+    int T;
+    if (user->bytes_per_ms > 0 && user->processing_bytes_per_ms > 0)
+        T = user->bytes_per_ms < user->processing_bytes_per_ms
+                ? user->bytes_per_ms
+                : user->processing_bytes_per_ms;
+    else if (user->bytes_per_ms > 0)
+        T = user->bytes_per_ms;
+    else if (user->processing_bytes_per_ms > 0)
+        T = user->processing_bytes_per_ms;
+    else
+        T = 0;
+
+    /* Floor T to the same minimum guac_client_get_throughput
+     * applies, so a pathologically slow user can't produce an
+     * unbounded wait here. Only applied when we actually have a
+     * sample. */
+    if (T > 0 && T < GUAC_CLIENT_MIN_THROUGHPUT)
+        T = GUAC_CLIENT_MIN_THROUGHPUT;
+
+    int wait = 0;
+
+    if (T > 0) {
+
+        /* Snapshot the bits of ring state we need under the sync
+         * lock, then drop it before doing the arithmetic. The lock
+         * is held only long enough to read three scalars; the
+         * ring contents themselves aren't iterated here (we just
+         * need the oldest entry's timestamp and the cached
+         * sum_ring_bytes). */
+        pthread_mutex_lock(&user->sync_emit_lock);
+        uint64_t read = user->sync_emit_read_index;
+        uint64_t write = user->sync_emit_write_index;
+        guac_timestamp oldest_ts = 0;
+        size_t bytes_in_flight = 0;
+        if (read < write) {
+            oldest_ts = user->sync_emit_history[
+                    read & GUAC_USER_SYNC_EMIT_HISTORY_MASK].timestamp;
+            bytes_in_flight = user->sum_ring_bytes;
+        }
+        pthread_mutex_unlock(&user->sync_emit_lock);
+
+        if (bytes_in_flight > 0) {
+
+            /* half RTT estimate from the user's stored
+             * estimated_rtt (kept in last_frame_duration). Zero
+             * for the very first iteration before any ack has
+             * arrived; that just biases the estimate slightly
+             * short for one frame, which the next iteration's
+             * fresh sample corrects. */
+            int half_rtt = user->last_frame_duration / 2;
+
+            int transit_ms = (int) (bytes_in_flight / (size_t) T);
+            guac_timestamp ready_at = oldest_ts + half_rtt + transit_ms;
+
+            wait = (int) (ready_at - args->now);
+            if (wait < 0)
+                wait = 0;
+        }
+
+    }
+    else {
+
+        /* Lag-based fallback used while this user has no
+         * throughput sample yet. processing_lag budgets how long
+         * the client needs to catch up to the most recent emit;
+         * we subtract the time already elapsed since that emit. */
+        int time_since = (int) (args->now
+                - user->client->last_sent_timestamp);
+        wait = user->processing_lag - time_since;
+        if (wait < 0)
+            wait = 0;
+
+    }
+
+    if (wait > args->max_wait)
+        args->max_wait = wait;
+
+    return NULL;
+}
+
+int guac_client_get_pacing_wait_ms(guac_client* client,
+        guac_timestamp now) {
+
+    __pacing_wait_args args = { .now = now, .max_wait = 0 };
+
+    guac_client_foreach_user(client, __compute_pacing_wait, &args);
+
+    return args.max_wait;
+
+}
+
 void guac_client_stream_argv(guac_client* client, guac_socket* socket,
         const char* mimetype, const char* name, const char* value) {
 

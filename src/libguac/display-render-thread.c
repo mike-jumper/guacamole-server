@@ -107,36 +107,66 @@ static void* guac_display_render_loop(void* data) {
             guac_flag_clear(&render_thread->state, GUAC_DISPLAY_RENDER_THREAD_STATE_FRAME_MODIFIED);
             guac_flag_unlock(&render_thread->state);
 
-            /* Use the amount of time that the client has been waiting
-             * for a frame vs. the amount of time that it took the
-             * client to process the most recently acknowledged frame
-             * to calculate the amount of additional delay required to
-             * allow the client to catch up. This value is used later,
-             * after everything else related to the frame has been
-             * finalized. */
-            int time_since_last_frame = guac_timestamp_current() - client->last_sent_timestamp;
-            int processing_lag = guac_client_get_processing_lag(client);
-            int required_wait = processing_lag - time_since_last_frame;
+            /* Wait until the client is projected to have finished
+             * receiving and processing everything currently in
+             * flight before kicking off the next frame.
+             * guac_client_get_pacing_wait_ms() does the projection
+             * per-user (oldest un-acked sync timestamp + half RTT
+             * + in-flight bytes / min(network, processing)
+             * throughput), aggregates across users via max, and
+             * falls back to processing_lag-based pacing for users
+             * that haven't yet produced a throughput sample.
+             *
+             * The wait is sync-preemptible: each iteration clears
+             * sync_state, re-queries the projected wait (which
+             * shrinks as acks reduce in-flight bytes / advance
+             * t_oldest), and either exits when the projection
+             * collapses to zero or waits up to
+             * GUAC_DISPLAY_MAX_LAG_COMPENSATION more for the next
+             * sync. The clamp per iteration keeps a silent client
+             * from freezing us indefinitely; total wait is bounded
+             * by however many ack-shortened iterations roll past
+             * before the projection reaches zero.
+             *
+             * Ordering is clear-then-check-then-wait so an ack
+             * arriving between the check and the clear isn't
+             * lost: clear first, re-query against the fresh state,
+             * only sleep if still positive. */
+            for (;;) {
 
-            /* Do not exceed a reasonable maximum framerate without an
-             * explicit frame boundary terminating the frame early */
-            int minimum_wait = GUAC_DISPLAY_RENDER_THREAD_MIN_FRAME_DURATION - frame_duration;
-            if (minimum_wait > required_wait)
-                required_wait = minimum_wait;
+                guac_flag_clear(&client->sync_state,
+                        GUAC_CLIENT_SYNC_RECEIVED);
 
-            /* Ensure we don't wait without bound when compensating for
-             * client-side processing delays */
-            else if (required_wait > GUAC_DISPLAY_MAX_LAG_COMPENSATION)
-                required_wait = GUAC_DISPLAY_MAX_LAG_COMPENSATION;
+                int wait = guac_client_get_pacing_wait_ms(client,
+                        guac_timestamp_current());
+                if (wait <= 0)
+                    break;
 
-            /* Wait for client to catch up, if necessary. Note that we don't do
-             * this via guac_flag_timedwait_and_lock() to avoid causing
-             * contention around the render_thread state lock. */
-            if (required_wait > 0) {
+                if (wait > GUAC_DISPLAY_MAX_LAG_COMPENSATION)
+                    wait = GUAC_DISPLAY_MAX_LAG_COMPENSATION;
+
                 guac_client_log(client, GUAC_LOG_TRACE,
-                        "Waiting %ims to compensate for client-side "
-                        "processing delays.", required_wait);
-                guac_timestamp_msleep(required_wait);
+                        "Waiting %ims for client to catch up "
+                        "(projection-based, sync-preemptible).",
+                        wait);
+
+                int preempted = guac_flag_timedwait_and_lock(
+                        &client->sync_state,
+                        GUAC_CLIENT_SYNC_RECEIVED,
+                        (unsigned) wait);
+
+                /* Timeout reached without an ack - proceed anyway.
+                 * Drawer threads have continued accumulating into
+                 * the pending frame throughout, so the next emit
+                 * will carry whatever piled up. */
+                if (!preempted)
+                    break;
+
+                guac_flag_unlock(&client->sync_state);
+
+                /* Sync arrived - loop re-clears, re-queries, and
+                 * either exits (caught up) or waits for more. */
+
             }
 
             /* Use explicit frame boundaries whenever available */
